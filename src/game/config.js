@@ -1,5 +1,5 @@
 export const CONFIG = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   storageKey: 'kantoku-hackslash-save-v1',
   season: {
     rounds: 8,
@@ -9,7 +9,10 @@ export const CONFIG = {
   },
   match: {
     managerPoints: 3,
-    regularInningsBeforeDecision: 6,
+    regularInningsBeforeDecision: 4,
+    interventionStartInning: 5,
+    interventionOpportunities: 3,
+    automaticPlateAppearancesBeforeChoice: 2,
     maxExtraInnings: 12,
     postseasonOpponentBoost: 7,
     playerOpeningBoost: 4

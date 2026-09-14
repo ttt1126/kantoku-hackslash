@@ -11,6 +11,8 @@ import {
 import {
   advanceToOffseason,
   applyMatchInstruction,
+  confirmMatchResult,
+  continueMatch,
   beginNextYearDraft,
   calculateHardValue,
   claimReward,
@@ -48,7 +50,7 @@ type GameState = any;
 type Player = any;
 
 const phaseTabs = [
-  { id: 'dashboard', label: '進行' },
+  { id: 'phase', label: '進行中' },
   { id: 'team', label: '編成' },
   { id: 'equipment', label: '装備' },
   { id: 'legacy', label: '名将' },
@@ -63,7 +65,7 @@ function App() {
       return null;
     }
   });
-  const [activeTab, setActiveTab] = useState('dashboard');
+  const [activeTab, setActiveTab] = useState('phase');
   const [message, setMessage] = useState('');
 
   useEffect(() => {
@@ -99,8 +101,8 @@ function App() {
     return <TitleScreen onStart={startGame} message={message} />;
   }
 
-  const focusedPhase = ['draft', 'equipment', 'match', 'reward', 'postseason', 'awards', 'offseason'].includes(game.phase)
-    ? game.phase
+  const focusedPhase = activeTab === 'phase'
+    ? (['draft', 'equipment', 'match', 'reward', 'postseason', 'awards', 'offseason'].includes(game.phase) ? game.phase : 'dashboard')
     : activeTab;
 
   return (
@@ -278,6 +280,16 @@ function DraftView({ game, commit }: ViewProps) {
               <Metric label="故障" value={candidate.injuryRange} />
             </div>
             <p>{candidate.scoutReport}</p>
+            <div className="ability-grid compact-grid">
+              {Object.entries(candidate.abilityRanges ?? {}).map(([key, range]: any) => (
+                <div key={key}>
+                  <span>{abilityLabel(key)}</span>
+                  <meter min={0} max={100} value={(range[0] + range[1]) / 2} />
+                  <strong>{range[0]}〜{range[1]}</strong>
+                </div>
+              ))}
+            </div>
+            <p className="small-note">現在能力は推定範囲、潜在は別評価です。評価確度は視察で向上します。</p>
             <p className="tags">{candidate.traits.join(' / ')}</p>
             <button className="primary-button" onClick={() => commit((next) => draftPlayer(next, candidate.id), `${candidate.name}を指名しました。`)}>
               指名
@@ -297,13 +309,14 @@ function DraftView({ game, commit }: ViewProps) {
 function EquipmentView({ game, commit }: ViewProps) {
   const tacticSlots = getTacticSlots(game);
   const trainingSlots = getTrainingSlots(game);
+  const readOnly = game.phase === 'match';
   return (
     <section className="view-stack">
       <div className="panel action-panel">
         <div>
           <p className="eyebrow">作戦と練習</p>
           <h2>装備枠 {game.equipment.tactics.length}/{tacticSlots} ・ {game.equipment.training.length}/{trainingSlots}</h2>
-          <p>作戦は試合中のアクティブ、練習はシーズン中のパッシブです。</p>
+          <p>{readOnly ? '試合中は閲覧のみです。装備変更は試合間に反映されます。' : '作戦は試合中のアクティブ、練習はシーズン中のパッシブです。'}</p>
         </div>
         {['draft', 'equipment'].includes(game.phase) && (
           <button className="primary-button" onClick={() => commit(startSeasonAfterDraft, 'シーズンが開幕しました。')}>
@@ -318,6 +331,7 @@ function EquipmentView({ game, commit }: ViewProps) {
         selected={game.equipment.tactics}
         unlocked={game.unlocked.tactics}
         slots={tacticSlots}
+        readOnly={readOnly}
         onToggle={(id: string, active: boolean) => commit((next) => (active ? unequipTactic(next, id) : equipTactic(next, id)), active ? '作戦を外しました。' : '作戦を装備しました。')}
       />
       <EquipmentList
@@ -326,30 +340,34 @@ function EquipmentView({ game, commit }: ViewProps) {
         selected={game.equipment.training}
         unlocked={game.unlocked.training}
         slots={trainingSlots}
+        readOnly={readOnly}
         onToggle={(id: string, active: boolean) => commit((next) => (active ? unequipTraining(next, id) : equipTraining(next, id)), active ? '練習方針を外しました。' : '練習方針を装備しました。')}
       />
     </section>
   );
 }
 
-function EquipmentList({ title, items, selected, unlocked, slots, onToggle }: any) {
+function EquipmentList({ title, items, selected, unlocked, slots, readOnly, onToggle }: any) {
+  const ownedItems = items.filter((item: any) => unlocked.includes(item.id));
   return (
     <section className="panel">
-      <h2>{title}</h2>
+      <h2>{title} {selected.length}/{slots}</h2>
+      <p className="eyebrow">所持 {ownedItems.length}件 / {readOnly ? '閲覧のみ' : 'タップで装備切替'}</p>
       <div className="equipment-grid">
-        {items.map((item: any) => {
+        {ownedItems.map((item: any) => {
           const active = selected.includes(item.id);
-          const locked = !unlocked.includes(item.id);
           return (
             <button
               key={item.id}
               className={active ? 'equipment-card active' : 'equipment-card'}
-              disabled={locked || (!active && selected.length >= slots)}
+              disabled={readOnly || (!active && selected.length >= slots)}
               onClick={() => onToggle(item.id, active)}
             >
               <span className="rarity-pill">{rarityLabel(item.rarity)}</span>
               <strong>{item.name}</strong>
-              <span>{locked ? '未解放' : item.summary}</span>
+              <span>{active ? '装備中' : '所持'}</span>
+              <span>{item.summary}</span>
+              {item.detail && <small>{item.detail}</small>}
             </button>
           );
         })}
@@ -361,19 +379,74 @@ function EquipmentList({ title, items, selected, unlocked, slots, onToggle }: an
 function MatchView({ game, commit }: ViewProps) {
   const match = game.currentMatch;
   const options = getInstructionOptions(game);
+  if (match.status === 'final') {
+    return (
+      <section className="view-stack">
+        <section className="panel match-panel">
+          <p className="eyebrow">試合終了</p>
+          <h2>{teamName(game.teamId)} {match.playerScore} - {match.opponentScore} {match.opponentName}</h2>
+          <p>{match.finalResult.summary}</p>
+          <div className="mini-metrics">
+            <Metric label="勝敗" value={match.finalResult.playerWon ? '勝利' : '敗戦'} />
+            <Metric label="使用作戦" value={`${match.usedInstructions.filter((item: any) => item.tacticId !== 'hold').length}`} />
+            <Metric label="残りP" value={match.managerPoints} />
+          </div>
+        </section>
+        <section className="panel">
+          <h2>主要成績</h2>
+          <LogList entries={match.finalResult.keyStats} />
+        </section>
+        <section className="panel">
+          <h2>作戦ログ</h2>
+          <LogList
+            entries={match.usedInstructions.map((entry: any) => `${entry.before.shortLabel}: ${entry.name} / ${entry.after.playerScore}-${entry.after.opponentScore} / ${entry.probabilityText}`)}
+            empty="作戦使用なし"
+          />
+          <button className="primary-button" onClick={() => commit(confirmMatchResult, '試合結果を確認しました。')}>
+            結果を確定して進む
+          </button>
+        </section>
+      </section>
+    );
+  }
+
+  if (match.status === 'result' && match.lastInstructionResult) {
+    const result = match.lastInstructionResult;
+    return (
+      <section className="view-stack">
+        <section className="panel match-panel">
+          <p className="eyebrow">作戦結果</p>
+          <h2>{result.name}</h2>
+          <p>{result.before.shortLabel}から半イニング終了までの結果です。</p>
+          <div className="mini-metrics">
+            <Metric label="開始" value={`${result.before.playerScore}-${result.before.opponentScore}`} />
+            <Metric label="終了" value={`${result.after.playerScore}-${result.after.opponentScore}`} />
+            <Metric label="走者" value={result.after.baseText} />
+          </div>
+          <p className="small-note">補正: {result.effectsText}</p>
+          <p className="small-note">推定確率: {result.probabilityText}</p>
+        </section>
+        <section className="panel">
+          <h2>打席結果</h2>
+          <LogList entries={result.plays.map((play: any) => play.text)} />
+          <button className="primary-button" onClick={() => commit(continueMatch, '次の場面へ進みました。')}>
+            次の場面へ
+          </button>
+        </section>
+      </section>
+    );
+  }
+
+  const situation = match.situation;
   return (
     <section className="view-stack">
       <div className="panel match-panel">
         <p className="eyebrow">{match.kind === 'postseason' ? 'ポストシーズン' : `通常R${match.round}`}</p>
         <h2>{teamName(game.teamId)} {match.playerScore} - {match.opponentScore} {match.opponentName}</h2>
-        <div className="situation-box">
-          <strong>{match.context.label}</strong>
-          <span>{match.context.description}</span>
-          <span>監督ポイント: {match.managerPoints}</span>
-        </div>
+        {situation && <SituationPanel situation={situation} context={match.context} />}
       </div>
       <section className="panel">
-        <h2>指示</h2>
+        <h2>指示 {match.interventionCount}/{3}</h2>
         <div className="command-list">
           {options.map((option: any) => (
             <button
@@ -384,13 +457,46 @@ function MatchView({ game, commit }: ViewProps) {
             >
               <span>{option.cost}P</span>
               <strong>{option.name}</strong>
+              <small>{option.duration}</small>
               <small>{option.effectsText}</small>
               <small>{option.summary}</small>
+              {option.detail && <small>{option.detail}</small>}
+              {option.disabled && option.reason && <small className="warning-text">{option.reason}</small>}
             </button>
           ))}
         </div>
       </section>
     </section>
+  );
+}
+
+function SituationPanel({ situation, context }: any) {
+  return (
+    <div className="situation-box">
+      <div>
+        <strong>{situation.shortLabel}</strong>
+        <span>{situation.offenseIsPlayer ? '自チーム攻撃中' : '自チーム守備中'}</span>
+      </div>
+      <BaseDiamond bases={situation.bases} />
+      <div className="mini-metrics">
+        <Metric label="アウト" value={`${situation.outs}`} />
+        <Metric label="走者" value={situation.baseText} />
+        <Metric label="監督P" value={situation.managerPoints} />
+      </div>
+      <p>{context.description}</p>
+      <p className="small-note">打者: {situation.batterName} / 投手: {situation.pitcherName}</p>
+    </div>
+  );
+}
+
+function BaseDiamond({ bases }: { bases: boolean[] }) {
+  return (
+    <div className="base-diamond" aria-label={`走者 ${bases.map((base, index) => (base ? `${index + 1}塁` : '')).filter(Boolean).join(' ') || 'なし'}`}>
+      <span className={bases[1] ? 'base active second' : 'base second'}>2</span>
+      <span className={bases[2] ? 'base active third' : 'base third'}>3</span>
+      <span className={bases[0] ? 'base active first' : 'base first'}>1</span>
+      <span className="home-base">H</span>
+    </div>
   );
 }
 
@@ -415,14 +521,63 @@ function RewardView({ game, commit }: ViewProps) {
             <span className="rarity-pill">{rarityLabel(reward.rarity)}</span>
             <h3>{reward.label}</h3>
             <p>{reward.description}</p>
+            <RewardDetail reward={reward} game={game} />
             <button className="primary-button" disabled={!canPay} onClick={() => commit((next) => claimReward(next, reward.id), `${reward.label}を獲得しました。`)}>
-              獲得
+              {offer.cost > 0 ? `${offer.cost}資金で獲得` : '獲得'}
             </button>
           </article>
         ))}
       </div>
     </section>
   );
+}
+
+function RewardDetail({ reward, game }: any) {
+  if (reward.type === 'veteran') {
+    const player = reward.payload.player;
+    return (
+      <div className="reward-detail">
+        <p className="eyebrow">{player.age}歳 / {player.position} / {player.batsThrows}</p>
+        <div className="ability-grid compact-grid">
+          {Object.entries(player.abilities).map(([key, value]) => (
+            <div key={key}>
+              <span>{abilityLabel(key)}</span>
+              <meter min={0} max={100} value={Number(value)} />
+              <strong>{String(value)}</strong>
+            </div>
+          ))}
+        </div>
+        <p className="tags">{player.traits.join(' / ')}</p>
+      </div>
+    );
+  }
+  if (reward.type === 'tactic') {
+    const tactic = TACTICS.find((item) => item.id === reward.payload.id);
+    return tactic ? (
+      <div className="reward-detail">
+        <p>{tactic.detail}</p>
+        <p className="small-note">条件: {tactic.side === 'offense' ? '攻撃中' : '守備中'} / 持続: {tactic.duration === 'halfInning' ? '半イニング' : '1打席'} / コスト: {tactic.cost}P</p>
+        <p className="small-note">現在: {game.unlocked.tactics.includes(tactic.id) ? '所持済み。重複時は素材化' : '未所持'}</p>
+      </div>
+    ) : null;
+  }
+  if (reward.type === 'training') {
+    const plan = TRAINING_PLANS.find((item) => item.id === reward.payload.id);
+    return plan ? (
+      <div className="reward-detail">
+        <p>{plan.summary}</p>
+        <p className="small-note">現在: {game.unlocked.training.includes(plan.id) ? '所持済み。重複時は素材化' : '未所持'} / 装備枠を1枠使用</p>
+      </div>
+    ) : null;
+  }
+  if (reward.type === 'item') {
+    const item = CONSUMABLE_ITEMS.find((entry) => entry.id === reward.payload.itemId);
+    return item ? <p className="small-note">使用条件: {item.usePhase === 'any' ? 'いつでも' : item.usePhase} / 対象: {item.target === 'player' ? '選手' : 'なし'}</p> : null;
+  }
+  if (reward.type === 'funds') return <p className="small-note">現在資金 {game.funds} → {game.funds + reward.payload.amount}</p>;
+  if (reward.type === 'materials') return <p className="small-note">現在素材 {game.materials} → {game.materials + reward.payload.amount}</p>;
+  if (reward.type === 'xp') return <p className="small-note">全所属選手に分配。若手育成方針と相性が良い報酬です。</p>;
+  return null;
 }
 
 function PostseasonView({ game, commit }: ViewProps) {
@@ -499,10 +654,12 @@ function OffseasonView({ game, commit }: ViewProps) {
         <button onClick={() => commit((next) => performOffseasonAction(next, 'course'), '講習を受けました。')}>
           <strong>講習を受ける</strong>
           <span>監督特殊能力を獲得または強化</span>
+          <small>行動1回消費。候補から1つを最大Lv2まで強化。</small>
         </button>
         <button onClick={() => commit((next) => performOffseasonAction(next, 'scout'), '視察を行いました。')}>
           <strong>視察</strong>
           <span>次回ドラフト候補と情報精度を強化</span>
+          <small>行動1回消費。候補数と推定範囲の精度を上げる。</small>
         </button>
         <div className="coach-box">
           <label>
@@ -518,6 +675,7 @@ function OffseasonView({ game, commit }: ViewProps) {
           <button onClick={() => commit((next) => performOffseasonAction(next, 'coach', targetId), '直接指導しました。')}>
             <strong>直接指導</strong>
             <span>対象選手の能力を上げる</span>
+            <small>行動1回消費。選択中の選手におおむね+1〜+5成長。</small>
           </button>
         </div>
       </section>
@@ -571,14 +729,19 @@ function PlayerProfile({ game, player, commit }: { game: GameState; player: Play
         <Metric label="疲労" value={`${player.fatigue}`} />
       </div>
       <div className="ability-grid">
-        {Object.entries(player.abilities).map(([key, value]) => (
-          <div key={key}>
-            <span>{abilityLabel(key)}</span>
-            <meter min={0} max={100} value={Number(value)} />
-            <strong>{String(value)}</strong>
-          </div>
-        ))}
+        {Object.entries(player.abilities).map(([key, value]) => {
+          const base = player.seasonBaseline?.abilities?.[key];
+          const delta = typeof base === 'number' ? Number(value) - base : null;
+          return (
+            <div key={key}>
+              <span>{abilityLabel(key)}</span>
+              <meter min={0} max={100} value={Number(value)} />
+              <strong>{String(value)}{delta !== null && ` (${delta >= 0 ? '+' : ''}${delta})`}</strong>
+            </div>
+          );
+        })}
       </div>
+      <p className="small-note">成長基準: {player.seasonBaseline?.year ?? game.year}年 {player.seasonBaseline?.reason ?? '記録開始時点'}</p>
       <section className="stat-line">
         {player.role === 'hitter' ? (
           <>

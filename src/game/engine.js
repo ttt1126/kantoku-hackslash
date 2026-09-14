@@ -73,6 +73,7 @@ export function createNewGame(options = {}) {
   };
 
   ensureRosterDepth(state);
+  markSeasonBaseline(state, '年度開始時点');
   prepareDraft(state);
   return state;
 }
@@ -332,6 +333,7 @@ export function startSeasonAfterDraft(state) {
 }
 
 export function equipTactic(state, tacticId) {
+  if (state.phase === 'match') throw new Error('試合中は装備を変更できません。');
   if (!state.unlocked.tactics.includes(tacticId)) throw new Error('未解放の作戦です。');
   if (state.equipment.tactics.includes(tacticId)) return;
   if (state.equipment.tactics.length >= getTacticSlots(state)) throw new Error('作戦装備枠が足りません。');
@@ -340,11 +342,13 @@ export function equipTactic(state, tacticId) {
 }
 
 export function unequipTactic(state, tacticId) {
+  if (state.phase === 'match') throw new Error('試合中は装備を変更できません。');
   state.equipment.tactics = state.equipment.tactics.filter((id) => id !== tacticId);
   touch(state);
 }
 
 export function equipTraining(state, trainingId) {
+  if (state.phase === 'match') throw new Error('試合中は装備を変更できません。');
   if (!state.unlocked.training.includes(trainingId)) throw new Error('未解放の練習方針です。');
   if (state.equipment.training.includes(trainingId)) return;
   if (state.equipment.training.length >= getTrainingSlots(state)) throw new Error('練習方針装備枠が足りません。');
@@ -353,6 +357,7 @@ export function equipTraining(state, trainingId) {
 }
 
 export function unequipTraining(state, trainingId) {
+  if (state.phase === 'match') throw new Error('試合中は装備を変更できません。');
   state.equipment.training = state.equipment.training.filter((id) => id !== trainingId);
   touch(state);
 }
@@ -457,6 +462,7 @@ function generateDraftCandidate(rng, { elite = false, accuracy = 0 } = {}) {
   );
   const injurySpread = Math.max(5, 22 - accuracy * 3);
   const injuryRisk = randomInt(rng, 5, 48);
+  const abilityRanges = createAbilityRanges(abilities, accuracy);
   return {
     id: makeId('cand', rng),
     name: createName(rng),
@@ -465,6 +471,7 @@ function generateDraftCandidate(rng, { elite = false, accuracy = 0 } = {}) {
     batsThrows: createBatsThrows(rng, role),
     position,
     abilities,
+    abilityRanges,
     currentOverall: clamp(currentOverall + randomInt(rng, -CONFIG.draft.currentAbilityNoise, CONFIG.draft.currentAbilityNoise), 1, 100),
     potential,
     potentialRange: [
@@ -475,12 +482,12 @@ function generateDraftCandidate(rng, { elite = false, accuracy = 0 } = {}) {
     injuryRisk,
     injuryRange: injuryRiskRange(injuryRisk, injurySpread),
     traits: shuffle(rng, PLAYER_TRAITS).slice(0, chance(rng, elite ? 0.45 : 0.2) ? 2 : 1),
-    scoutReport: pick(rng, SCOUT_REPORTS)
+    scoutReport: createDraftScoutReport({ role, abilities, abilityRanges, potentialRange: [clamp(potential - potentialSpread, 1, 100), clamp(potential + potentialSpread, 1, 100)] })
   };
 }
 
 function createPlayerFromCandidate(candidate, year) {
-  return {
+  const player = {
     id: candidate.id.replace('cand', 'ply'),
     name: candidate.name,
     role: candidate.role,
@@ -501,6 +508,8 @@ function createPlayerFromCandidate(candidate, year) {
     stats: createStats(candidate.role),
     history: []
   };
+  markPlayerJoinBaseline(player, year, 'ドラフト加入時点');
+  return player;
 }
 
 function hitterAbilities(rng, base) {
@@ -554,6 +563,41 @@ function injuryLabel(value) {
   return '危険';
 }
 
+function createAbilityRanges(abilities, accuracy = 0) {
+  const spread = Math.max(4, 13 - accuracy * 2);
+  return Object.fromEntries(
+    Object.entries(abilities).map(([key, value]) => [
+      key,
+      [clamp(value - spread, 1, 100), clamp(value + spread, 1, 100)]
+    ])
+  );
+}
+
+function rangeMid(range) {
+  return Math.round((range[0] + range[1]) / 2);
+}
+
+function createDraftScoutReport(candidate) {
+  const ranges = candidate.abilityRanges;
+  if (candidate.role === 'pitcher') {
+    const strengths = [
+      ['球威', ranges.power],
+      ['制球', ranges.control],
+      ['変化球', ranges.breaking],
+      ['スタミナ', ranges.stamina]
+    ].sort((a, b) => rangeMid(b[1]) - rangeMid(a[1]));
+    return `${strengths[0][0]}を軸に評価される投手。${strengths[1][0]}も候補内で見劣りせず、潜在評価は${candidate.potentialRange[0]}〜${candidate.potentialRange[1]}の幅で見ている。`;
+  }
+  const strengths = [
+    ['打撃', ranges.contact],
+    ['長打', ranges.power],
+    ['選球眼', ranges.eye],
+    ['走塁', ranges.speed],
+    ['守備', ranges.fielding]
+  ].sort((a, b) => rangeMid(b[1]) - rangeMid(a[1]));
+  return `${strengths[0][0]}に強みが出そうな野手。${strengths[1][0]}も伸びしろ込みで評価でき、潜在評価は${candidate.potentialRange[0]}〜${candidate.potentialRange[1]}の幅で見ている。`;
+}
+
 function makeId(prefix, rng) {
   return `${prefix}_${Math.floor(randomFloat(rng) * 0xffffffff).toString(36)}`;
 }
@@ -577,6 +621,29 @@ function effectiveAbility(player, key, training = {}) {
 function average(values) {
   if (!values.length) return 50;
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function copyAbilities(abilities) {
+  return Object.fromEntries(Object.entries(abilities).map(([key, value]) => [key, value]));
+}
+
+function markSeasonBaseline(state, reason = '年度開始時点') {
+  for (const player of state.roster) {
+    player.seasonBaseline = {
+      year: state.year,
+      reason,
+      abilities: copyAbilities(player.abilities)
+    };
+  }
+}
+
+function markPlayerJoinBaseline(player, year, reason = '加入時点') {
+  player.joinedYear = player.joinedYear ?? year;
+  player.seasonBaseline = {
+    year,
+    reason,
+    abilities: copyAbilities(player.abilities)
+  };
 }
 
 function assertPhase(state, phase) {
@@ -621,26 +688,38 @@ export function startPostseasonGame(state) {
 
 export function getInstructionOptions(state) {
   if (!state.currentMatch) return [];
+  const match = state.currentMatch;
+  if (match.status !== 'selecting') return [];
   const hold = {
     id: 'hold',
     name: '静観',
     cost: 0,
-    summary: '監督ポイントを温存し、現在の戦力だけで進める。',
+    summary: '監督ポイントを温存し、この場面は選手に任せる。',
+    duration: 'この半イニング',
+    detail: '作戦効果なし。回数とポイントは消費しない。',
     expectedDelta: 0,
+    disabled: false,
+    reason: '',
     effectsText: '期待値変化なし'
   };
   const tactics = state.equipment.tactics
     .map((id) => TACTICS.find((item) => item.id === id))
     .filter(Boolean)
     .map((tactic) => {
-      const expectedDelta = estimateTacticDelta(state.currentMatch.context, tactic);
+      const validation = validateTacticForSituation(state, tactic);
+      const expectedDelta = estimateTacticDelta(match.context, tactic);
       return {
         id: tactic.id,
         name: tactic.name,
         cost: tactic.cost,
         summary: tactic.summary,
+        detail: tactic.detail,
+        side: tactic.side,
+        duration: tactic.duration === 'halfInning' ? '半イニング終了まで' : '次の打席だけ',
+        condition: tactic.condition ?? 'none',
         expectedDelta,
-        disabled: tactic.cost > state.currentMatch.managerPoints,
+        disabled: !validation.ok,
+        reason: validation.reason,
         effectsText: expectedDelta >= 0 ? `得点期待 +${expectedDelta.toFixed(2)}` : `得点期待 ${expectedDelta.toFixed(2)}`
       };
     });
@@ -651,46 +730,72 @@ export function applyMatchInstruction(state, tacticId = 'hold') {
   assertPhase(state, 'match');
   const match = state.currentMatch;
   if (!match) throw new Error('進行中の試合がありません。');
+  if (match.status !== 'selecting') throw new Error('現在は作戦を選択できません。');
   const tactic = tacticId === 'hold' ? null : TACTICS.find((item) => item.id === tacticId);
   if (tactic && !state.equipment.tactics.includes(tactic.id)) throw new Error('装備していない作戦です。');
-  if (tactic && tactic.cost > match.managerPoints) throw new Error('監督ポイントが足りません。');
+  if (tactic) {
+    const validation = validateTacticForSituation(state, tactic);
+    if (!validation.ok) throw new Error(validation.reason);
+  }
 
   const effects = tactic ? { ...tactic.effects } : {};
   if (tactic) match.managerPoints -= tactic.cost;
-  match.selectedInstruction = tactic ? tactic.name : '静観';
-  match.expectedDelta = tactic ? estimateTacticDelta(match.context, tactic) : 0;
-  match.log.push(`${match.context.label}で${match.selectedInstruction}を選択した。`);
-
-  const opponent = {
-    id: match.opponentId,
-    rating: match.opponentRating
+  const before = createSituationSnapshot(state, match);
+  const probabilities = estimateCurrentProbabilities(state, match, effects);
+  const result = simulateHalfToEnd(state, match, tactic, effects);
+  const after = createSituationSnapshot(state, match);
+  const instruction = tactic ? tactic.name : '静観';
+  const expectedDelta = tactic ? estimateTacticDelta(match.context, tactic) : 0;
+  const entry = {
+    id: makeId('used', state.rng),
+    tacticId: tactic?.id ?? 'hold',
+    name: instruction,
+    expectedDelta,
+    duration: tactic?.duration ?? 'halfInning',
+    side: match.situation.offenseIsPlayer ? 'offense' : 'defense',
+    before,
+    after,
+    plays: result.plays,
+    effectsText: tactic ? describeEffects(tactic.effects) : '作戦効果なし',
+    probabilityText: tactic ? describeProbabilityChange(probabilities) : '確率補正なし',
+    cost: tactic?.cost ?? 0
   };
-  const lineup = selectLineup(state);
-  const pitcher = state.roster.find((player) => player.id === match.pitcherId) ?? selectPitcher(state);
-  let inning = match.inning;
-  while (inning <= 9) {
-    const result = simulateInning(state, lineup, pitcher, opponent, effects, match.hitterIndex);
-    match.hitterIndex = result.hitterIndex;
-    match.playerScore += result.playerRuns;
-    match.opponentScore += result.opponentRuns;
-    inning += 1;
-  }
+  match.selectedInstruction = instruction;
+  match.expectedDelta = expectedDelta;
+  match.interventionCount += 1;
+  match.usedInstructions.push(entry);
+  match.lastInstructionResult = entry;
+  match.status = 'result';
+  match.log.unshift(`${before.shortLabel}で${instruction}を選択。${result.runs}点、${result.plays.length}打席。`);
+  match.context = createMatchContext(state, match);
+  touch(state);
+}
 
-  while (match.playerScore === match.opponentScore && inning <= CONFIG.match.maxExtraInnings) {
-    const result = simulateInning(state, lineup, pitcher, opponent, effects, match.hitterIndex);
-    match.hitterIndex = result.hitterIndex;
-    match.playerScore += result.playerRuns;
-    match.opponentScore += result.opponentRuns;
-    inning += 1;
+export function continueMatch(state) {
+  assertPhase(state, 'match');
+  const match = state.currentMatch;
+  if (!match) throw new Error('進行中の試合がありません。');
+  if (match.status === 'result') {
+    match.lastInstructionResult = null;
+    advanceHalf(match);
+    prepareNextDecisionOrFinish(state, match);
+    touch(state);
+    return;
   }
-
-  if (match.playerScore === match.opponentScore) {
-    if (teamPower(state).overall >= match.opponentRating) match.playerScore += 1;
-    else match.opponentScore += 1;
+  if (match.status === 'selecting') {
+    applyMatchInstruction(state, 'hold');
+    return;
   }
+  throw new Error('試合結果を確認してください。');
+}
 
-  const playerWon = match.playerScore > match.opponentScore;
-  applyPostGameFatigue(state, effects);
+export function confirmMatchResult(state) {
+  assertPhase(state, 'match');
+  const match = state.currentMatch;
+  if (!match || match.status !== 'final' || !match.finalResult) throw new Error('確認できる試合結果がありません。');
+  const playerWon = match.finalResult.playerWon;
+  const combinedEffects = combineUsedInstructionEffects(match);
+  applyPostGameFatigue(state, combinedEffects);
   awardGameExperience(state, playerWon);
   recordMatchHistory(state, match, playerWon);
 
@@ -772,13 +877,30 @@ export function selectRewardRarity(roll, tier = 'light') {
 }
 
 export function createRewardOffer(state, tier) {
-  const options = Array.from({ length: 3 }, () => createRewardOption(state, tier));
+  const options = [];
+  const signatures = new Set();
+  for (let attempt = 0; options.length < 3 && attempt < 18; attempt += 1) {
+    const option = createRewardOption(state, tier);
+    const signature = rewardSignature(option);
+    if (signatures.has(signature)) continue;
+    signatures.add(signature);
+    options.push(option);
+  }
+  while (options.length < 3) options.push(createRewardOption(state, tier));
   return {
     id: makeId('reward', state.rng),
     tier,
     cost: tier === 'strong' ? CONFIG.economy.strongRewardCost : 0,
     options
   };
+}
+
+function rewardSignature(option) {
+  if (option.type === 'funds' || option.type === 'materials' || option.type === 'xp') return option.type;
+  if (option.type === 'item') return `${option.type}:${option.payload.itemId}`;
+  if (option.type === 'tactic' || option.type === 'training') return `${option.type}:${option.payload.id}`;
+  if (option.type === 'veteran') return `veteran:${option.payload.player.role}:${option.payload.player.position}`;
+  return `${option.type}:${option.label}`;
 }
 
 export function claimReward(state, rewardId) {
@@ -888,6 +1010,7 @@ export function beginNextYearDraft(state) {
   state.funds += 85 + getLegacyPerkLevel(state, 'legacy-funds') * 20 - (hasHardCondition(state, 'funds-down') ? 35 : 0);
   resetSeasonPlayerStats(state);
   ensureRosterDepth(state);
+  markSeasonBaseline(state, '年度開始時点');
   state.awards = null;
   state.offseason = null;
   state.currentMatch = null;
@@ -980,11 +1103,49 @@ export function serializeGame(state) {
 
 export function loadGame(jsonText) {
   const parsed = JSON.parse(jsonText);
-  if (parsed.schemaVersion !== CONFIG.schemaVersion) {
+  if ((parsed.schemaVersion ?? 1) > CONFIG.schemaVersion) {
     throw new Error(`非対応のセーブデータです。schemaVersion=${parsed.schemaVersion}`);
   }
   if (!parsed.rng || typeof parsed.rng.state !== 'number') throw new Error('乱数状態が保存されていません。');
+  migrateGameState(parsed);
   return parsed;
+}
+
+function migrateGameState(state) {
+  const previousVersion = state.schemaVersion ?? 1;
+  state.schemaVersion = CONFIG.schemaVersion;
+  state.modifiers = {
+    ...createSeasonModifiers(),
+    ...(state.modifiers ?? {})
+  };
+  state.matchHistory = state.matchHistory ?? [];
+  state.seasonLog = state.seasonLog ?? [];
+  for (const player of state.roster ?? []) {
+    player.history = player.history ?? [];
+    player.stats = player.stats ?? createStats(player.role);
+    if (!player.seasonBaseline) {
+      player.seasonBaseline = {
+        year: state.year,
+        reason: previousVersion < 2 ? '記録開始時点' : '年度開始時点',
+        abilities: copyAbilities(player.abilities)
+      };
+    }
+  }
+  if (state.draft?.pool) {
+    for (const candidate of state.draft.pool) {
+      candidate.abilityRanges = candidate.abilityRanges ?? createAbilityRanges(candidate.abilities, state.modifiers.scoutAccuracyBonus ?? 0);
+      candidate.scoutReport =
+        candidate.scoutReport ??
+        createDraftScoutReport({
+          role: candidate.role,
+          abilityRanges: candidate.abilityRanges,
+          potentialRange: candidate.potentialRange
+        });
+    }
+  }
+  if (state.phase === 'match' && state.currentMatch) {
+    normalizeCurrentMatch(state);
+  }
 }
 
 function chooseRegularOpponent(state) {
@@ -997,6 +1158,7 @@ function chooseRegularOpponent(state) {
 function createMatch(state, { kind, opponentId, opponentName, opponentRating }) {
   const lineup = selectLineup(state);
   const pitcher = selectPitcher(state);
+  const statBaselines = createStatBaselines(state.roster);
   markGameAppearances(lineup, pitcher);
   const match = {
     id: makeId('match', state.rng),
@@ -1006,27 +1168,418 @@ function createMatch(state, { kind, opponentId, opponentName, opponentRating }) 
     opponentRating,
     round: state.round,
     gameInRound: state.gameInRound,
-    inning: CONFIG.match.regularInningsBeforeDecision + 1,
+    inning: 1,
+    half: 'top',
+    halfState: { outs: 0, bases: [null, null, null] },
     playerScore: 0,
     opponentScore: 0,
     hitterIndex: 0,
+    opponentBatterIndex: 0,
+    lineupIds: lineup.map((player) => player.id),
     pitcherId: pitcher.id,
+    statBaselines,
     managerPoints: getManagerPoints(state),
+    interventionCount: 0,
+    status: 'selecting',
     context: null,
+    situation: null,
     selectedInstruction: null,
     expectedDelta: 0,
+    usedInstructions: [],
+    lastInstructionResult: null,
+    finalResult: null,
     log: []
   };
-  const opponent = { id: opponentId, rating: opponentRating };
-  for (let inning = 1; inning <= CONFIG.match.regularInningsBeforeDecision; inning += 1) {
-    const result = simulateInning(state, lineup, pitcher, opponent, {}, match.hitterIndex);
-    match.hitterIndex = result.hitterIndex;
-    match.playerScore += result.playerRuns;
-    match.opponentScore += result.opponentRuns;
-  }
-  match.context = createMatchContext(state, match);
+  simulateUntilInning(state, match, CONFIG.match.regularInningsBeforeDecision + 1);
   match.log.push(`${CONFIG.match.regularInningsBeforeDecision}回まで自動進行。`);
+  prepareNextDecisionOrFinish(state, match);
   return match;
+}
+
+function normalizeCurrentMatch(state) {
+  const match = state.currentMatch;
+  const lineup = selectLineup(state);
+  const pitcher = state.roster.find((player) => player.id === match.pitcherId) ?? selectPitcher(state);
+  match.inning = match.inning ?? CONFIG.match.regularInningsBeforeDecision + 1;
+  match.half = match.half ?? 'top';
+  match.halfState = match.halfState ?? { outs: 0, bases: [null, null, null] };
+  match.hitterIndex = match.hitterIndex ?? 0;
+  match.opponentBatterIndex = match.opponentBatterIndex ?? 0;
+  match.lineupIds = match.lineupIds ?? lineup.map((player) => player.id);
+  match.pitcherId = pitcher.id;
+  match.interventionCount = match.interventionCount ?? 0;
+  match.usedInstructions = match.usedInstructions ?? [];
+  match.status = match.status ?? 'selecting';
+  match.finalResult = match.finalResult ?? null;
+  match.lastInstructionResult = match.lastInstructionResult ?? null;
+  prepareNextDecisionOrFinish(state, match);
+}
+
+function simulateUntilInning(state, match, inning) {
+  while (!isMatchFinished(match) && match.inning < inning) {
+    simulateHalfToEnd(state, match, null, {});
+    advanceHalf(match);
+  }
+}
+
+function prepareNextDecisionOrFinish(state, match) {
+  if (isMatchFinished(match)) {
+    finalizeCurrentMatchForReview(state, match);
+    return;
+  }
+
+  while (!isMatchFinished(match)) {
+    if (match.interventionCount >= CONFIG.match.interventionOpportunities) {
+      simulateRestOfGame(state, match);
+      finalizeCurrentMatchForReview(state, match);
+      return;
+    }
+
+    if (match.inning < CONFIG.match.interventionStartInning) {
+      simulateHalfToEnd(state, match, null, {});
+      advanceHalf(match);
+      continue;
+    }
+
+    const prePlays = randomInt(state.rng, 0, CONFIG.match.automaticPlateAppearancesBeforeChoice);
+    for (let count = 0; count < prePlays && match.halfState.outs < 3; count += 1) {
+      simulatePlateAppearance(state, match, {});
+    }
+    if (match.halfState.outs >= 3) {
+      advanceHalf(match);
+      continue;
+    }
+
+    match.status = 'selecting';
+    match.situation = createSituationSnapshot(state, match);
+    match.context = createMatchContext(state, match);
+    return;
+  }
+
+  finalizeCurrentMatchForReview(state, match);
+}
+
+function simulateRestOfGame(state, match) {
+  while (!isMatchFinished(match)) {
+    simulateHalfToEnd(state, match, null, {});
+    advanceHalf(match);
+  }
+}
+
+function isMatchFinished(match) {
+  if (match.inning > CONFIG.match.maxExtraInnings) return true;
+  return match.inning > 9 && match.playerScore !== match.opponentScore;
+}
+
+function finalizeCurrentMatchForReview(state, match) {
+  if (match.playerScore === match.opponentScore) {
+    if (teamPower(state).overall >= match.opponentRating) match.playerScore += 1;
+    else match.opponentScore += 1;
+  }
+  const playerWon = match.playerScore > match.opponentScore;
+  match.status = 'final';
+  match.situation = null;
+  match.finalResult = {
+    playerWon,
+    playerScore: match.playerScore,
+    opponentScore: match.opponentScore,
+    summary: `${match.opponentName}戦は${match.playerScore}-${match.opponentScore}で${playerWon ? '勝利' : '敗戦'}。`,
+    keyStats: createMatchKeyStats(state, match),
+    instructions: match.usedInstructions
+  };
+}
+
+function simulateHalfToEnd(state, match, tactic, effects) {
+  const plays = [];
+  const startScore = { player: match.playerScore, opponent: match.opponentScore };
+  let plateAppearances = 0;
+  while (match.halfState.outs < 3) {
+    const activeEffects = tactic?.duration === 'plateAppearance' && plateAppearances > 0 ? {} : effects;
+    plays.push(simulatePlateAppearance(state, match, activeEffects));
+    plateAppearances += 1;
+  }
+  return {
+    plays,
+    runs: match.playerScore - startScore.player + match.opponentScore - startScore.opponent
+  };
+}
+
+function simulatePlateAppearance(state, match, effects) {
+  const before = createSituationSnapshot(state, match);
+  if (match.half === 'top') {
+    const lineup = getLineupPlayers(state, match);
+    const batter = lineup[match.hitterIndex % lineup.length];
+    match.hitterIndex += 1;
+    const outcome = rollPlayerBattingOutcome(state, batter, match.opponentRating, effects);
+    const play = applyBattingOutcomeByIds(state, match.halfState.bases, batter, outcome);
+    match.halfState.outs += play.outs;
+    match.playerScore += play.runs;
+    return createPlaySummary(before, createSituationSnapshot(state, match), batter.name, outcome, play.runs, play.outs);
+  }
+
+  const pitcher = state.roster.find((player) => player.id === match.pitcherId) ?? selectPitcher(state);
+  const batterName = `相手${(match.opponentBatterIndex % 9) + 1}番`;
+  match.opponentBatterIndex += 1;
+  const outcome = rollOpponentOutcome(state, pitcher, match.opponentRating, effects);
+  const play = applyOpponentOutcome(match.halfState.bases, outcome);
+  match.halfState.outs += play.outs;
+  match.opponentScore += play.runs;
+  pitcher.stats.er += play.runs;
+  pitcher.stats.outs += play.outs;
+  return createPlaySummary(before, createSituationSnapshot(state, match), batterName, outcome, play.runs, play.outs);
+}
+
+function createPlaySummary(before, after, batterName, outcome, runs, outs) {
+  return {
+    batterName,
+    outcome,
+    outcomeLabel: outcomeLabel(outcome),
+    runs,
+    outs,
+    before,
+    after,
+    text: `${batterName}: ${outcomeLabel(outcome)} / ${runs ? `${runs}点` : '無得点'} / ${outs ? `${outs}アウト` : '走者更新'}`
+  };
+}
+
+function outcomeLabel(outcome) {
+  return {
+    bb: '四球',
+    single: '単打',
+    double: '二塁打',
+    triple: '三塁打',
+    hr: '本塁打',
+    so: '三振',
+    out: '凡退'
+  }[outcome] ?? outcome;
+}
+
+function getLineupPlayers(state, match) {
+  const players = match.lineupIds
+    .map((id) => state.roster.find((player) => player.id === id))
+    .filter(Boolean);
+  return players.length ? players : selectLineup(state);
+}
+
+function applyBattingOutcomeByIds(state, bases, batter, outcome) {
+  batter.stats.pa += 1;
+  if (outcome === 'bb') {
+    batter.stats.bb += 1;
+    return advanceBaseIds(state, bases, batter.id, 0, true);
+  }
+  if (outcome === 'out' || outcome === 'so') {
+    batter.stats.ab += 1;
+    if (outcome === 'so') batter.stats.so += 1;
+    return { runs: 0, outs: 1 };
+  }
+  batter.stats.ab += 1;
+  batter.stats.h += 1;
+  const basesGained = outcome === 'single' ? 1 : outcome === 'double' ? 2 : outcome === 'triple' ? 3 : 4;
+  batter.stats.tb += basesGained;
+  if (outcome === 'hr') batter.stats.hr += 1;
+  const play = advanceBaseIds(state, bases, batter.id, basesGained, false);
+  batter.stats.rbi += play.runs;
+  return play;
+}
+
+function advanceBaseIds(state, bases, batterId, basesGained, walk) {
+  let runs = 0;
+  const scoreRunner = (runnerId) => {
+    const runner = state.roster.find((player) => player.id === runnerId);
+    if (runner) runner.stats.r += 1;
+    runs += 1;
+  };
+  if (walk) {
+    if (bases[0] && bases[1] && bases[2]) scoreRunner(bases[2]);
+    if (bases[0] && bases[1]) bases[2] = bases[1];
+    if (bases[0]) bases[1] = bases[0];
+    bases[0] = batterId;
+    return { runs, outs: 0 };
+  }
+
+  for (let index = 2; index >= 0; index -= 1) {
+    const runnerId = bases[index];
+    if (!runnerId) continue;
+    bases[index] = null;
+    const destination = index + basesGained;
+    if (destination >= 3) scoreRunner(runnerId);
+    else bases[destination] = runnerId;
+  }
+  if (basesGained >= 4) scoreRunner(batterId);
+  else bases[basesGained - 1] = batterId;
+  return { runs, outs: 0 };
+}
+
+function advanceHalf(match) {
+  match.halfState = { outs: 0, bases: [null, null, null] };
+  if (match.half === 'top') {
+    match.half = 'bottom';
+  } else {
+    match.half = 'top';
+    match.inning += 1;
+  }
+}
+
+function createSituationSnapshot(state, match) {
+  const offenseIsPlayer = match.half === 'top';
+  const lineup = getLineupPlayers(state, match);
+  const batter = offenseIsPlayer ? lineup[match.hitterIndex % lineup.length]?.name ?? '打者未定' : `相手${(match.opponentBatterIndex % 9) + 1}番`;
+  const pitcher = offenseIsPlayer
+    ? `${match.opponentName}先発`
+    : state.roster.find((player) => player.id === match.pitcherId)?.name ?? '投手未定';
+  const bases = match.halfState.bases.map(Boolean);
+  const halfLabel = match.half === 'top' ? '表' : '裏';
+  const shortLabel = `${match.inning}回${halfLabel} ${offenseIsPlayer ? '攻撃' : '守備'}`;
+  return {
+    inning: match.inning,
+    half: match.half,
+    halfLabel,
+    shortLabel,
+    offenseIsPlayer,
+    offenseLabel: offenseIsPlayer ? getTeamDefinition(state.teamId)?.shortName ?? '自軍' : match.opponentName,
+    defenseLabel: offenseIsPlayer ? match.opponentName : getTeamDefinition(state.teamId)?.shortName ?? '自軍',
+    playerScore: match.playerScore,
+    opponentScore: match.opponentScore,
+    outs: match.halfState.outs,
+    bases,
+    baseText: bases.map((active, index) => (active ? `${index + 1}塁` : null)).filter(Boolean).join('・') || '走者なし',
+    batterName: batter,
+    pitcherName: pitcher,
+    managerPoints: match.managerPoints
+  };
+}
+
+function validateTacticForSituation(state, tactic) {
+  const match = state.currentMatch;
+  const situation = match?.situation;
+  if (!match || !situation) return { ok: false, reason: '試合状況がありません。' };
+  if (tactic.cost > match.managerPoints) return { ok: false, reason: '監督ポイントが足りません。' };
+  if (tactic.side === 'offense' && !situation.offenseIsPlayer) return { ok: false, reason: '自軍攻撃中のみ使えます。' };
+  if (tactic.side === 'defense' && situation.offenseIsPlayer) return { ok: false, reason: '自軍守備中のみ使えます。' };
+  if (tactic.condition === 'runnerOnThird' && !situation.bases[2]) return { ok: false, reason: '三塁走者がいる場面で使えます。' };
+  if (tactic.condition === 'runnerOnBase' && !situation.bases.some(Boolean)) return { ok: false, reason: '走者がいる場面で使えます。' };
+  if (tactic.condition === 'lateInning' && situation.inning < 7) return { ok: false, reason: '7回以降に使えます。' };
+  return { ok: true, reason: '' };
+}
+
+function estimateCurrentProbabilities(state, match, effects) {
+  if (!match.situation) return null;
+  if (match.situation.offenseIsPlayer) {
+    const lineup = getLineupPlayers(state, match);
+    const batter = lineup[match.hitterIndex % lineup.length];
+    return {
+      kind: 'offense',
+      before: playerOutcomeRates(state, batter, match.opponentRating, {}),
+      after: playerOutcomeRates(state, batter, match.opponentRating, effects)
+    };
+  }
+  const pitcher = state.roster.find((player) => player.id === match.pitcherId) ?? selectPitcher(state);
+  return {
+    kind: 'defense',
+    before: opponentOutcomeRates(state, pitcher, match.opponentRating, {}),
+    after: opponentOutcomeRates(state, pitcher, match.opponentRating, effects)
+  };
+}
+
+function playerOutcomeRates(state, batter, opponentRating, effects) {
+  const training = getTrainingEffects(state);
+  const contact = effectiveAbility(batter, 'contact', training);
+  const power = effectiveAbility(batter, 'power', training);
+  const eye = effectiveAbility(batter, 'eye', training);
+  return {
+    walk: clamp(0.072 + (eye - opponentRating) * 0.0011 + (effects.walk ?? 0), 0.025, 0.18),
+    hr: clamp(0.018 + (power - opponentRating) * 0.0007 + (effects.hr ?? 0), 0.004, 0.085),
+    hit: clamp(0.185 + (contact - opponentRating) * 0.0013 + (effects.hit ?? 0), 0.11, 0.35)
+  };
+}
+
+function opponentOutcomeRates(state, pitcher, opponentRating, effects) {
+  const training = getTrainingEffects(state);
+  const pitchPower = effectiveAbility(pitcher, 'power', training);
+  const control = effectiveAbility(pitcher, 'control', training);
+  const breaking = effectiveAbility(pitcher, 'breaking', training);
+  const pitching = pitchPower * 0.36 + control * 0.32 + breaking * 0.32;
+  const hardBoost = hasHardCondition(state, 'npc-plus') ? 5 : 0;
+  return {
+    walk: clamp(0.078 + (opponentRating + hardBoost - control) * 0.001 + (effects.pitcherWalk ?? 0), 0.025, 0.18),
+    hr: clamp(0.019 + (opponentRating + hardBoost - pitchPower) * 0.00065 - (effects.preventHr ?? 0), 0.003, 0.085),
+    hit: clamp(0.19 + (opponentRating + hardBoost - pitching) * 0.0012 - (effects.preventHit ?? 0), 0.1, 0.36)
+  };
+}
+
+function pct(value) {
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function describeProbabilityChange(probabilities) {
+  if (!probabilities) return '確率補正は推定できません。';
+  const label = probabilities.kind === 'offense' ? ['安打', '本塁打', '四球'] : ['被安打', '被本塁打', '与四球'];
+  return `${label[0]} ${pct(probabilities.before.hit)}→${pct(probabilities.after.hit)} / ${label[1]} ${pct(probabilities.before.hr)}→${pct(probabilities.after.hr)} / ${label[2]} ${pct(probabilities.before.walk)}→${pct(probabilities.after.walk)}`;
+}
+
+function describeEffects(effects) {
+  const entries = [];
+  if (effects.hit) entries.push(`安打率${effects.hit > 0 ? '+' : ''}${pct(effects.hit)}`);
+  if (effects.hr) entries.push(`本塁打率${effects.hr > 0 ? '+' : ''}${pct(effects.hr)}`);
+  if (effects.walk) entries.push(`四球率${effects.walk > 0 ? '+' : ''}${pct(effects.walk)}`);
+  if (effects.preventHit) entries.push(`被安打率-${pct(effects.preventHit)}`);
+  if (effects.preventHr) entries.push(`被本塁打率-${pct(effects.preventHr)}`);
+  if (effects.pitcherWalk) entries.push(`与四球率+${pct(effects.pitcherWalk)}`);
+  if (effects.runPrevention) entries.push(`失点期待-${effects.runPrevention.toFixed(2)}`);
+  return entries.join(' / ') || '明示的な確率補正なし';
+}
+
+function combineUsedInstructionEffects(match) {
+  const combined = {};
+  for (const instruction of match.usedInstructions ?? []) {
+    const tactic = TACTICS.find((item) => item.id === instruction.tacticId);
+    if (!tactic) continue;
+    for (const key of ['fatigueHitters', 'fatiguePitchers']) {
+      combined[key] = (combined[key] ?? 0) + (tactic.effects[key] ?? 0);
+    }
+  }
+  return combined;
+}
+
+function createMatchKeyStats(state, match) {
+  const hitters = state.roster
+    .filter((player) => player.role === 'hitter')
+    .map((player) => {
+      const base = match.statBaselines?.[player.id] ?? {};
+      return {
+        player,
+        h: (player.stats.h ?? 0) - (base.h ?? 0),
+        hr: (player.stats.hr ?? 0) - (base.hr ?? 0),
+        rbi: (player.stats.rbi ?? 0) - (base.rbi ?? 0)
+      };
+    })
+    .filter((entry) => entry.h > 0 || entry.hr > 0 || entry.rbi > 0)
+    .sort((a, b) => b.rbi - a.rbi || b.h - a.h)
+    .slice(0, 3)
+    .map((entry) => `${entry.player.name}: ${entry.h}安打 ${entry.hr}本 ${entry.rbi}打点`);
+  const pitcher = state.roster
+    .filter((player) => player.role === 'pitcher')
+    .sort((a, b) => {
+      const aBase = match.statBaselines?.[a.id] ?? {};
+      const bBase = match.statBaselines?.[b.id] ?? {};
+      return (b.stats.outs - (bBase.outs ?? 0)) - (a.stats.outs - (aBase.outs ?? 0));
+    })[0];
+  const pitching = pitcher
+    ? (() => {
+        const base = match.statBaselines?.[pitcher.id] ?? {};
+        const outs = (pitcher.stats.outs ?? 0) - (base.outs ?? 0);
+        const so = (pitcher.stats.so ?? 0) - (base.so ?? 0);
+        const er = (pitcher.stats.er ?? 0) - (base.er ?? 0);
+        return [`${pitcher.name}: ${formatInningsForSummary(outs)}回 ${so}奪三振 ${er}自責点`];
+      })()
+    : [];
+  return [...hitters, ...pitching].filter(Boolean);
+}
+
+function formatInningsForSummary(outs) {
+  const innings = Math.floor(outs / 3);
+  const rest = outs % 3;
+  return rest ? `${innings}.${rest}` : `${innings}`;
 }
 
 function selectLineup(state) {
@@ -1048,6 +1601,22 @@ function selectPitcher(state) {
 function markGameAppearances(lineup, pitcher) {
   for (const player of lineup) player.stats.games += 1;
   pitcher.stats.games += 1;
+}
+
+function createStatBaselines(roster) {
+  return Object.fromEntries(
+    roster.map((player) => [
+      player.id,
+      {
+        h: player.stats.h ?? 0,
+        hr: player.stats.hr ?? 0,
+        rbi: player.stats.rbi ?? 0,
+        outs: player.stats.outs ?? 0,
+        so: player.stats.so ?? 0,
+        er: player.stats.er ?? 0
+      }
+    ])
+  );
 }
 
 function simulateInning(state, lineup, pitcher, opponent, effects, hitterIndex) {
@@ -1319,7 +1888,9 @@ function recordMatchHistory(state, match, playerWon) {
     opponentScore: match.opponentScore,
     playerWon,
     instruction: match.selectedInstruction,
-    expectedDelta: match.expectedDelta
+    expectedDelta: match.expectedDelta,
+    instructions: match.usedInstructions ?? [],
+    keyStats: match.finalResult?.keyStats ?? []
   });
   state.matchHistory = state.matchHistory.slice(0, 30);
 }
@@ -1439,6 +2010,7 @@ function createRewardOption(state, tier) {
     const player = generatePlayer(state.rng, role, randomInt(state.rng, 31, 36), false);
     player.contractUntilYear = state.year;
     player.condition = 5;
+    markPlayerJoinBaseline(player, state.year, '報酬加入時点');
     return rewardOption(state, 'veteran', rarity, `期限付き補強 ${player.name}`, `${player.position}の即戦力。今季終了まで在籍。`, { player });
   }
 
@@ -1495,6 +2067,7 @@ function applyReward(state, reward) {
     if (state.modifiers.nextRewardExtraRecruit) {
       const extra = generatePlayer(state.rng, chance(state.rng, 0.45) ? 'pitcher' : 'hitter', randomInt(state.rng, 30, 35), false);
       extra.contractUntilYear = state.year;
+      markPlayerJoinBaseline(extra, state.year, '追加補強加入時点');
       state.roster.push(extra);
       state.modifiers.nextRewardExtraRecruit = false;
     }

@@ -6,6 +6,8 @@ import {
   applyMatchInstruction,
   beginNextYearDraft,
   claimReward,
+  confirmMatchResult,
+  continueMatch,
   createNewGame,
   draftPlayer,
   equipTactic,
@@ -54,7 +56,7 @@ describe('監督ハクスラ core loop', () => {
     while (state.phase !== 'postseason' && state.phase !== 'awards') {
       if (state.phase === 'dashboard') {
         startNextGame(state);
-        applyMatchInstruction(state, 'hold');
+        finishCurrentMatch(state);
       }
       if (state.phase === 'reward') {
         getPlayerTeam(state).wins += 5;
@@ -64,6 +66,32 @@ describe('監督ハクスラ core loop', () => {
 
     expect(state.round).toBe(CONFIG.season.rounds);
     expect(state.phase).toBe('postseason');
+  });
+
+  it('作戦結果を確認してから試合結果を確定する', () => {
+    const state = createNewGame({ seed: 'match-review' });
+    skipDraft(state);
+    startSeasonAfterDraft(state);
+    startNextGame(state);
+    expect(state.currentMatch.status).toBe('selecting');
+    applyMatchInstruction(state, 'hold');
+    expect(state.currentMatch.status).toBe('result');
+    continueMatch(state);
+    finishCurrentMatch(state);
+    expect(state.currentMatch).toBe(null);
+    expect(state.matchHistory[0].keyStats.length).toBeGreaterThan(0);
+  });
+
+  it('攻守や状況に合わない作戦をゲーム処理側で拒否する', () => {
+    const state = createNewGame({ seed: 'tactic-side' });
+    skipDraft(state);
+    startSeasonAfterDraft(state);
+    startNextGame(state);
+    const offense = state.currentMatch.situation.offenseIsPlayer;
+    const invalid = TACTICS.find((tactic) => tactic.side === (offense ? 'defense' : 'offense'));
+    state.unlocked.tactics = TACTICS.map((item) => item.id);
+    state.equipment.tactics = [invalid.id];
+    expect(() => applyMatchInstruction(state, invalid.id)).toThrow(offense ? '守備中' : '攻撃中');
   });
 
   it('日本シリーズは4勝先取で決着する', () => {
@@ -104,6 +132,15 @@ describe('監督ハクスラ core loop', () => {
     expect(() => equipTactic(state, TACTICS[CONFIG.equipment.tacticSlots].id)).toThrow('作戦装備枠');
     for (const training of TRAINING_PLANS.slice(0, CONFIG.equipment.trainingSlots)) equipTraining(state, training.id);
     expect(() => equipTraining(state, TRAINING_PLANS[CONFIG.equipment.trainingSlots].id)).toThrow('練習方針装備枠');
+  });
+
+  it('試合中は装備を変更できない', () => {
+    const state = createNewGame({ seed: 'equipment-during-match' });
+    skipDraft(state);
+    startSeasonAfterDraft(state);
+    startNextGame(state);
+    state.unlocked.tactics = TACTICS.map((item) => item.id);
+    expect(() => equipTactic(state, TACTICS[4].id)).toThrow('試合中');
   });
 
   it('報酬レアリティを重みに沿って選ぶ', () => {
@@ -177,6 +214,16 @@ describe('監督ハクスラ core loop', () => {
     expect(nextB).toBe(nextA);
   });
 
+  it('旧セーブを読み込み、成長基準を記録開始時点として補完する', () => {
+    const state = createNewGame({ seed: 'save-v1' });
+    const legacy = JSON.parse(serializeGame(state));
+    legacy.schemaVersion = 1;
+    for (const player of legacy.roster) delete player.seasonBaseline;
+    const loaded = loadGame(JSON.stringify(legacy));
+    expect(loaded.schemaVersion).toBe(CONFIG.schemaVersion);
+    expect(loaded.roster[0].seasonBaseline.reason).toBe('記録開始時点');
+  });
+
   it('次年度ドラフトへ進行できる', () => {
     const state = createNewGame({ seed: 'next-year' });
     processSeasonEnd(state, { champion: false, reason: '検証' });
@@ -187,3 +234,11 @@ describe('監督ハクスラ core loop', () => {
     expect(state.draft.year).toBe(2);
   });
 });
+
+function finishCurrentMatch(state) {
+  while (state.currentMatch?.status !== 'final') {
+    if (state.currentMatch.status === 'selecting') applyMatchInstruction(state, 'hold');
+    if (state.currentMatch.status === 'result') continueMatch(state);
+  }
+  confirmMatchResult(state);
+}

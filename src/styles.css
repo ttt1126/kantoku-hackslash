@@ -353,6 +353,18 @@ textarea {
   font-weight: 800;
 }
 
+.small-note,
+.warning-text {
+  margin-bottom: 0;
+  color: #5b665f;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.warning-text {
+  color: #9b2226;
+}
+
 .equipment-card,
 .command-card,
 .offseason-actions > button,
@@ -399,10 +411,74 @@ textarea {
 
 .situation-box {
   display: grid;
-  gap: 4px;
+  gap: 10px;
   border-radius: 8px;
   padding: 12px;
   background: #eaf2ff;
+}
+
+.base-diamond {
+  position: relative;
+  width: 104px;
+  height: 104px;
+  margin: 0 auto;
+}
+
+.base,
+.home-base {
+  position: absolute;
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 2px solid #56706a;
+  border-radius: 4px;
+  background: #fffef9;
+  color: #56706a;
+  font-size: 0.78rem;
+  font-weight: 900;
+  transform: rotate(45deg);
+}
+
+.base.active {
+  border-color: #d79b2d;
+  background: #ffd166;
+  color: #201704;
+}
+
+.base.second {
+  top: 2px;
+  left: 37px;
+}
+
+.base.third {
+  top: 37px;
+  left: 2px;
+}
+
+.base.first {
+  top: 37px;
+  right: 2px;
+}
+
+.home-base {
+  right: 37px;
+  bottom: 2px;
+  border-color: #173f35;
+  background: #173f35;
+  color: #f8fff8;
+}
+
+.base-diamond span {
+  line-height: 1;
+}
+
+.reward-detail {
+  display: grid;
+  gap: 8px;
+  border-radius: 8px;
+  padding: 9px;
+  background: #f4f7f5;
 }
 
 .standing-row,
@@ -428,6 +504,14 @@ textarea {
   grid-template-columns: 92px 1fr 34px;
   align-items: center;
   gap: 8px;
+}
+
+.compact-grid {
+  gap: 6px;
+}
+
+.compact-grid > div {
+  grid-template-columns: 82px 1fr 58px;
 }
 
 meter {
