@@ -1,5 +1,5 @@
 export const CONFIG = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   storageKey: 'kantoku-hackslash-save-v1',
   season: {
     rounds: 8,
@@ -14,8 +14,14 @@ export const CONFIG = {
     interventionOpportunities: 3,
     automaticPlateAppearancesBeforeChoice: 2,
     maxExtraInnings: 12,
-    postseasonOpponentBoost: 7,
-    playerOpeningBoost: 4
+    postseasonOpponentBoost: 4,
+    playerOpeningBoost: 0,
+    starterFatigueLimit: 58,
+    starterHookFatigue: 42,
+    starterHookRuns: 4,
+    starterMinOutsForHook: 12,
+    closerLeadMax: 3,
+    closerStartInning: 9
   },
   draft: {
     maxPlayerPicks: 3,
@@ -27,11 +33,21 @@ export const CONFIG = {
   },
   roster: {
     initialHitters: 10,
-    initialPitchers: 6,
-    minimumHitters: 9,
-    minimumPitchers: 4,
+    initialPitchers: 7,
+    minimumHitters: 10,
+    minimumPitchers: 7,
+    fieldPositions: ['捕手', '一塁手', '二塁手', '三塁手', '遊撃手', '左翼手', '中堅手', '右翼手'],
+    lineupPositions: ['捕手', '一塁手', '二塁手', '三塁手', '遊撃手', '左翼手', '中堅手', '右翼手', 'DH'],
+    starterSlots: 3,
+    relieverSlots: 3,
     retireAgeFloor: 36,
     forcedRetireAge: 42
+  },
+  development: {
+    inSeasonBase: 0.2,
+    activeMultiplier: 1,
+    reserveMultiplier: 0.25,
+    directCoachBase: 5
   },
   equipment: {
     tacticSlots: 3,

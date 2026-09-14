@@ -103,7 +103,7 @@ export const TRAINING_PLANS = [
     rarity: 'normal',
     tags: ['打撃'],
     summary: '長打力+5、三振が少し増える。',
-    effects: { power: 5, strikeout: 0.01, fatigue: 1 }
+    effects: { hitterPower: 5, strikeout: 0.01, fatigue: 1 }
   },
   {
     id: 'zone-discipline',
@@ -240,7 +240,7 @@ export const PLAYER_TRAITS = [
   'ムードメーカー'
 ];
 
-export const HITTER_POSITIONS = ['捕手', '一塁手', '二塁手', '三塁手', '遊撃手', '外野手'];
+export const HITTER_POSITIONS = ['捕手', '一塁手', '二塁手', '三塁手', '遊撃手', '左翼手', '中堅手', '右翼手'];
 export const PITCHER_POSITIONS = ['先発', '中継ぎ', '抑え'];
 
 export const FAMILY_NAMES = [

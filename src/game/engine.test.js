@@ -13,15 +13,21 @@ import {
   equipTactic,
   equipTraining,
   getPlayerTeam,
+  getRosterPlan,
   grantChampionshipRewards,
   loadGame,
+  moveLineupSlot,
   processSeasonEnd,
   recordPostseasonResult,
   selectRewardRarity,
   serializeGame,
+  skipCurrentMatch,
   skipDraft,
+  skipNextGame,
   startNextGame,
   startSeasonAfterDraft,
+  updateLineupSlot,
+  updatePitchingPlan,
   useItem,
   performOffseasonAction
 } from './engine.js';
@@ -46,6 +52,42 @@ describe('監督ハクスラ core loop', () => {
     expect(state.draft.pool).toHaveLength(beforeCount - 2);
     expect(state.draft.pool.some((candidate) => candidate.id === pickedId)).toBe(false);
     expect(state.draft.aiLog).toHaveLength(1);
+  });
+
+  it('初期チームに必要ポジションと投手役割がそろう', () => {
+    const state = createNewGame({ seed: 'roster-depth' });
+    const hitters = state.roster.filter((player) => player.role === 'hitter');
+    for (const position of CONFIG.roster.fieldPositions) {
+      expect(hitters.some((player) => player.defensePositions.includes(position))).toBe(true);
+    }
+    expect(state.roster.filter((player) => player.role === 'pitcher' && player.position === '先発')).toHaveLength(3);
+    expect(state.roster.filter((player) => player.role === 'pitcher' && player.position === '中継ぎ')).toHaveLength(3);
+    expect(state.roster.filter((player) => player.role === 'pitcher' && player.position === '抑え')).toHaveLength(1);
+    const plan = getRosterPlan(state);
+    expect(plan.lineup.map((slot) => slot.playerId)).toHaveLength(9);
+    expect(new Set(plan.lineup.map((slot) => slot.playerId)).size).toBe(9);
+  });
+
+  it('編集した打順と先発ローテが試合へ反映される', () => {
+    const state = createNewGame({ seed: 'lineup-edit' });
+    skipDraft(state);
+    startSeasonAfterDraft(state);
+    const originalLast = getRosterPlan(state).lineup[8].playerId;
+    moveLineupSlot(state, 8, -1);
+    const editedPlan = getRosterPlan(state);
+    const scheduledStarter = editedPlan.rotation[1];
+    state.rosterPlan.nextStarterIndex = 1;
+    startNextGame(state);
+    expect(state.currentMatch.lineupIds[7]).toBe(originalLast);
+    expect(state.currentMatch.pitcherId).toBe(scheduledStarter);
+  });
+
+  it('投手起用は役割違いと重複登録を拒否する', () => {
+    const state = createNewGame({ seed: 'pitching-validation' });
+    const reliever = state.roster.find((player) => player.role === 'pitcher' && player.position === '中継ぎ');
+    const starter = state.roster.find((player) => player.role === 'pitcher' && player.position === '先発');
+    expect(() => updatePitchingPlan(state, 'rotation', 0, reliever.id)).toThrow('先発枠');
+    expect(() => updatePitchingPlan(state, 'rotation', 1, starter.id)).toThrow('複数');
   });
 
   it('8ラウンド終了後に順位に応じてポストシーズンへ進む', () => {
@@ -94,6 +136,35 @@ describe('監督ハクスラ core loop', () => {
     expect(() => applyMatchInstruction(state, invalid.id)).toThrow(offense ? '守備中' : '攻撃中');
   });
 
+  it('途中スキップは試合を再抽選せず結果確認で止まり、継投ログを残す', () => {
+    const state = createNewGame({ seed: 'skip-current-match' });
+    skipDraft(state);
+    startSeasonAfterDraft(state);
+    startNextGame(state);
+    const matchId = state.currentMatch.id;
+    state.currentMatch.pitchingLog[0].er = 5;
+    state.currentMatch.opponentScore += 5;
+    skipCurrentMatch(state);
+    expect(state.currentMatch.id).toBe(matchId);
+    expect(state.currentMatch.status).toBe('final');
+    expect(state.currentMatch.pitchingLog.length).toBeGreaterThan(1);
+  });
+
+  it('試合経験による年度内成長が保存される', () => {
+    const state = createNewGame({ seed: 'in-season-growth' });
+    const young = state.roster.find((player) => player.role === 'hitter' && player.age <= 24);
+    young.potential = 100;
+    young.growthProgress = 0.95;
+    skipDraft(state);
+    startSeasonAfterDraft(state);
+    skipNextGame(state);
+    confirmMatchResult(state);
+    const grown = state.roster.find((player) => player.id === young.id);
+    expect((grown.growthLog ?? []).some((entry) => entry.reason === '試合経験')).toBe(true);
+    const loaded = loadGame(serializeGame(state));
+    expect(loaded.roster.find((player) => player.id === young.id).growthLog.length).toBeGreaterThan(0);
+  });
+
   it('日本シリーズは4勝先取で決着する', () => {
     const state = createNewGame({ seed: 'japan-series' });
     state.phase = 'postseason';
@@ -107,6 +178,29 @@ describe('監督ハクスラ core loop', () => {
     recordPostseasonResult(state, true, { playerScore: 5, opponentScore: 2 });
     expect(state.phase).toBe('awards');
     expect(state.awards.champion).toBe(true);
+  });
+
+  it('CSファイナルはアドバンテージと引き分けを含めて勝ち上がり判定する', () => {
+    const state = createNewGame({ seed: 'cs-advantage' });
+    state.phase = 'postseason';
+    state.postseason = {
+      stage: 'csFinal',
+      stageLabel: 'CSファイナルステージ',
+      playerWins: 2,
+      opponentWins: 2,
+      draws: 1,
+      gamesPlayed: 5,
+      maxGames: 6,
+      winsToAdvance: 4,
+      playerAdvantageWins: 1,
+      opponentAdvantageWins: 0,
+      highSeed: 'player',
+      opponentId: state.teams.find((team) => team.id !== state.teamId).id,
+      log: []
+    };
+    recordPostseasonResult(state, null, { playerScore: 3, opponentScore: 3 });
+    expect(state.phase).toBe('postseason');
+    expect(state.postseason.stage).toBe('japanSeries');
   });
 
   it('年齢増加、成長、衰え、引退を処理する', () => {

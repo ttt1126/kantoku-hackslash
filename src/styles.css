@@ -537,6 +537,78 @@ meter {
   padding: 11px;
 }
 
+.action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.segmented-control {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.segmented-control button {
+  min-height: 38px;
+  border: 1px solid rgba(23, 63, 53, 0.18);
+  border-radius: 8px;
+  background: #f7faf7;
+  color: #26352f;
+  font-weight: 800;
+}
+
+.segmented-control button.active {
+  background: #173f35;
+  color: #f8fff8;
+}
+
+.lineup-editor,
+.pitching-editor,
+.coach-detail {
+  display: grid;
+  gap: 8px;
+}
+
+.lineup-row {
+  display: grid;
+  grid-template-columns: 26px 92px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid rgba(23, 63, 53, 0.12);
+  border-radius: 8px;
+  background: #fbfcf8;
+}
+
+.lineup-row > span {
+  grid-column: 2 / -1;
+  color: #5a665f;
+  font-size: 0.82rem;
+}
+
+.row-buttons {
+  display: flex;
+  gap: 4px;
+}
+
+.pitching-select {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 6px 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid rgba(23, 63, 53, 0.12);
+  border-radius: 8px;
+  background: #fbfcf8;
+}
+
+.pitching-select small {
+  grid-column: 2;
+  color: #5a665f;
+}
+
 .bottom-tabs {
   position: fixed;
   right: 0;

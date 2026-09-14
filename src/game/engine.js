@@ -18,6 +18,9 @@ import {
 import { chance, createRng, pick, randomFloat, randomInt, shuffle, weightedPick } from './rng.js';
 import { battingRates, cloneStats, createStats, pitchingRates } from './stats.js';
 
+const FIELD_POSITIONS = CONFIG.roster.fieldPositions;
+const LINEUP_POSITIONS = CONFIG.roster.lineupPositions;
+
 export function createNewGame(options = {}) {
   const rng = createRng(options.seed ?? `${Date.now()}`);
   const teamId = options.teamId ?? TEAMS[0].id;
@@ -63,6 +66,7 @@ export function createNewGame(options = {}) {
     },
     inventory: [],
     modifiers: createSeasonModifiers(),
+    rosterPlan: null,
     currentMatch: null,
     rewardOffer: null,
     postseason: null,
@@ -73,6 +77,7 @@ export function createNewGame(options = {}) {
   };
 
   ensureRosterDepth(state);
+  ensureRosterPlan(state);
   markSeasonBaseline(state, '年度開始時点');
   prepareDraft(state);
   return state;
@@ -175,6 +180,89 @@ export function getTrainingEffects(state) {
   return effects;
 }
 
+export function getRosterPlan(state) {
+  ensureRosterDepth(state);
+  ensureRosterPlan(state);
+  return state.rosterPlan;
+}
+
+export function updateLineupSlot(state, slotIndex, patch) {
+  if (state.phase === 'match') throw new Error('試合中は編成変更できません。');
+  ensureRosterDepth(state);
+  ensureRosterPlan(state);
+  const nextSlots = state.rosterPlan.lineup.map((slot, index) => (index === slotIndex ? { ...slot, ...patch } : { ...slot }));
+  validateLineupSlots(state, nextSlots);
+  state.rosterPlan.lineup = nextSlots;
+  touch(state);
+}
+
+export function moveLineupSlot(state, slotIndex, direction) {
+  if (state.phase === 'match') throw new Error('試合中は打順変更できません。');
+  ensureRosterPlan(state);
+  const target = slotIndex + direction;
+  if (target < 0 || target >= state.rosterPlan.lineup.length) return;
+  const nextSlots = state.rosterPlan.lineup.map((slot) => ({ ...slot }));
+  [nextSlots[slotIndex], nextSlots[target]] = [nextSlots[target], nextSlots[slotIndex]];
+  validateLineupSlots(state, nextSlots);
+  state.rosterPlan.lineup = nextSlots;
+  touch(state);
+}
+
+export function updatePitchingPlan(state, section, index, playerId) {
+  if (state.phase === 'match') throw new Error('試合中は投手起用を変更できません。');
+  ensureRosterDepth(state);
+  ensureRosterPlan(state);
+  const nextPlan = cloneRosterPlan(state.rosterPlan);
+  if (section === 'rotation') nextPlan.rotation[index] = playerId;
+  else if (section === 'relievers') nextPlan.bullpen.relievers[index] = playerId;
+  else if (section === 'closer') nextPlan.bullpen.closerId = playerId;
+  else throw new Error('不明な投手枠です。');
+  validatePitchingPlan(state, nextPlan);
+  state.rosterPlan = nextPlan;
+  touch(state);
+}
+
+export function canPlayPosition(player, position) {
+  if (!player || player.role !== 'hitter') return false;
+  if (position === 'DH') return true;
+  return normalizeDefensePositions(player).includes(position);
+}
+
+export function abilityLabelForPlayer(player, key) {
+  return abilityLabelForRole(player?.role, key);
+}
+
+export function abilityLabelForRole(role, key) {
+  const hitter = {
+    contact: 'ミート',
+    power: '長打力',
+    eye: '選球眼',
+    speed: '走力',
+    fielding: '守備力',
+    arm: '肩力',
+    durability: '耐久力'
+  };
+  const pitcher = {
+    power: '球威',
+    control: '制球',
+    breaking: '変化球',
+    stamina: 'スタミナ',
+    fielding: '守備力',
+    durability: '耐久力'
+  };
+  return (role === 'pitcher' ? pitcher : hitter)[key] ?? key;
+}
+
+export function getAbilityEntries(entity) {
+  const role = entity?.role ?? 'hitter';
+  const order = role === 'pitcher'
+    ? ['power', 'control', 'breaking', 'stamina', 'fielding', 'durability']
+    : ['contact', 'power', 'eye', 'speed', 'fielding', 'arm', 'durability'];
+  return order
+    .filter((key) => entity?.abilities?.[key] !== undefined || entity?.abilityRanges?.[key] !== undefined)
+    .map((key) => ({ key, label: abilityLabelForRole(role, key) }));
+}
+
 export function playerOverall(player) {
   const values = Object.values(player.abilities);
   return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
@@ -275,6 +363,8 @@ export function draftPlayer(state, candidateId) {
   const [candidate] = state.draft.pool.splice(index, 1);
   const player = createPlayerFromCandidate(candidate, state.year);
   state.roster.push(player);
+  ensureRosterDepth(state);
+  ensureRosterPlan(state);
   state.draft.picks.push(player.id);
   state.seasonLog.unshift(`${candidate.name}をドラフトで指名した。`);
 
@@ -322,6 +412,7 @@ export function startSeasonAfterDraft(state) {
     throw new Error('シーズン準備中のみ開始できます。');
   }
   ensureRosterDepth(state);
+  ensureRosterPlan(state);
   trimEquipmentToSlots(state);
   state.round = 1;
   state.gameInRound = 0;
@@ -413,19 +504,24 @@ function createTeamRecords(playerTeamId, rng) {
 
 function generateInitialRoster(rng) {
   const roster = [];
-  for (let index = 0; index < CONFIG.roster.initialHitters; index += 1) {
-    roster.push(generatePlayer(rng, 'hitter', 22 + (index % 11), false));
-  }
-  for (let index = 0; index < CONFIG.roster.initialPitchers; index += 1) {
-    roster.push(generatePlayer(rng, 'pitcher', 23 + (index % 10), false));
-  }
+  const hitterRoles = [...FIELD_POSITIONS, 'DH', '代打'];
+  hitterRoles.forEach((position, index) => {
+    roster.push(generatePlayer(rng, 'hitter', 22 + (index % 10), false, { position, baseMin: 40, baseMax: 58 }));
+  });
+  const pitcherRoles = ['先発', '先発', '先発', '中継ぎ', '中継ぎ', '中継ぎ', '抑え'];
+  pitcherRoles.forEach((position, index) => {
+    roster.push(generatePlayer(rng, 'pitcher', 23 + (index % 9), false, { position, baseMin: 40, baseMax: 58 }));
+  });
   return roster;
 }
 
-function generatePlayer(rng, role, age = randomInt(rng, 18, 34), rookie = false) {
-  const base = rookie ? randomInt(rng, 42, 61) : randomInt(rng, 45, 70);
+function generatePlayer(rng, role, age = randomInt(rng, 18, 34), rookie = false, options = {}) {
+  const base = rookie
+    ? randomInt(rng, options.baseMin ?? 42, options.baseMax ?? 61)
+    : randomInt(rng, options.baseMin ?? 45, options.baseMax ?? 70);
   const potential = clamp(base + randomInt(rng, rookie ? 10 : 2, rookie ? 32 : 18), 45, 96);
-  const position = role === 'pitcher' ? pick(rng, PITCHER_POSITIONS) : HITTER_POSITIONS[randomInt(rng, 0, HITTER_POSITIONS.length - 1)];
+  const position = options.position ?? (role === 'pitcher' ? pick(rng, PITCHER_POSITIONS) : HITTER_POSITIONS[randomInt(rng, 0, HITTER_POSITIONS.length - 1)]);
+  const defensePositions = role === 'hitter' ? createDefensePositions(rng, position) : [];
   return {
     id: makeId(role, rng),
     name: createName(rng),
@@ -433,6 +529,7 @@ function generatePlayer(rng, role, age = randomInt(rng, 18, 34), rookie = false)
     age,
     batsThrows: createBatsThrows(rng, role),
     position,
+    defensePositions,
     abilities: role === 'pitcher' ? pitcherAbilities(rng, base) : hitterAbilities(rng, base),
     potential,
     growthType: pick(rng, GROWTH_TYPES).id,
@@ -445,8 +542,33 @@ function generatePlayer(rng, role, age = randomInt(rng, 18, 34), rookie = false)
     contractUntilYear: null,
     rejuvenated: false,
     stats: createStats(role),
+    growthProgress: 0,
+    growthLog: [],
     history: []
   };
+}
+
+function createDefensePositions(rng, position) {
+  if (position === 'DH' || position === '代打') {
+    const primary = pick(rng, FIELD_POSITIONS.filter((entry) => entry !== '捕手'));
+    return [primary, maybeCornerOutfield(primary)].filter(Boolean);
+  }
+  if (position === '外野手') return ['左翼手', '中堅手', '右翼手'];
+  const extras = [];
+  if (['左翼手', '中堅手', '右翼手'].includes(position)) {
+    extras.push(...['左翼手', '中堅手', '右翼手'].filter((entry) => entry !== position && chance(rng, 0.45)));
+  } else if (['二塁手', '遊撃手', '三塁手'].includes(position) && chance(rng, 0.35)) {
+    extras.push(pick(rng, ['二塁手', '遊撃手', '三塁手'].filter((entry) => entry !== position)));
+  } else if (position === '一塁手' && chance(rng, 0.25)) {
+    extras.push('左翼手');
+  }
+  return [...new Set([position, ...extras])];
+}
+
+function maybeCornerOutfield(position) {
+  if (position === '左翼手') return '右翼手';
+  if (position === '右翼手') return '左翼手';
+  return null;
 }
 
 function generateDraftCandidate(rng, { elite = false, accuracy = 0 } = {}) {
@@ -455,6 +577,7 @@ function generateDraftCandidate(rng, { elite = false, accuracy = 0 } = {}) {
   const potential = clamp(currentBase + randomInt(rng, elite ? 18 : 5, elite ? 32 : 28), 45, 98);
   const position = role === 'pitcher' ? pick(rng, PITCHER_POSITIONS) : pick(rng, HITTER_POSITIONS);
   const abilities = role === 'pitcher' ? pitcherAbilities(rng, currentBase) : hitterAbilities(rng, currentBase);
+  const defensePositions = role === 'hitter' ? createDefensePositions(rng, position) : [];
   const currentOverall = Math.round(average(Object.values(abilities)));
   const potentialSpread = Math.max(
     3,
@@ -470,6 +593,7 @@ function generateDraftCandidate(rng, { elite = false, accuracy = 0 } = {}) {
     age: randomInt(rng, 18, 22),
     batsThrows: createBatsThrows(rng, role),
     position,
+    defensePositions,
     abilities,
     abilityRanges,
     currentOverall: clamp(currentOverall + randomInt(rng, -CONFIG.draft.currentAbilityNoise, CONFIG.draft.currentAbilityNoise), 1, 100),
@@ -494,6 +618,7 @@ function createPlayerFromCandidate(candidate, year) {
     age: candidate.age,
     batsThrows: candidate.batsThrows,
     position: candidate.position,
+    defensePositions: candidate.defensePositions ? [...candidate.defensePositions] : createDefensePositions(createRng(candidate.id), candidate.position),
     abilities: { ...candidate.abilities },
     potential: candidate.potential,
     growthType: candidate.growthType,
@@ -506,6 +631,8 @@ function createPlayerFromCandidate(candidate, year) {
     contractUntilYear: null,
     rejuvenated: false,
     stats: createStats(candidate.role),
+    growthProgress: 0,
+    growthLog: [],
     history: []
   };
   markPlayerJoinBaseline(player, year, 'ドラフト加入時点');
@@ -603,14 +730,22 @@ function makeId(prefix, rng) {
 }
 
 function effectiveAbility(player, key, training = {}) {
-  const trainingKeyMap = {
-    power: 'power',
-    contact: 'contact',
-    eye: 'eye',
-    speed: 'speed',
-    fielding: 'fielding',
-    arm: 'arm'
-  };
+  const trainingKeyMap = player.role === 'pitcher'
+    ? {
+        power: 'pitcherPower',
+        control: 'control',
+        breaking: 'breaking',
+        stamina: 'stamina',
+        fielding: 'fielding'
+      }
+    : {
+        power: 'hitterPower',
+        contact: 'contact',
+        eye: 'eye',
+        speed: 'speed',
+        fielding: 'fielding',
+        arm: 'arm'
+      };
   const base = player.abilities[key] ?? 50;
   const trainingBoost = training[trainingKeyMap[key]] ?? 0;
   const conditionBoost = (player.condition ?? 0) * 0.7;
@@ -726,7 +861,7 @@ export function getInstructionOptions(state) {
   return [hold, ...tactics];
 }
 
-export function applyMatchInstruction(state, tacticId = 'hold') {
+export function applyMatchInstruction(state, tacticId = 'hold', advanceMode = 'decision') {
   assertPhase(state, 'match');
   const match = state.currentMatch;
   if (!match) throw new Error('進行中の試合がありません。');
@@ -742,7 +877,9 @@ export function applyMatchInstruction(state, tacticId = 'hold') {
   if (tactic) match.managerPoints -= tactic.cost;
   const before = createSituationSnapshot(state, match);
   const probabilities = estimateCurrentProbabilities(state, match, effects);
-  const result = simulateHalfToEnd(state, match, tactic, effects);
+  const result = advanceMode === 'play'
+    ? simulateSinglePlayForInstruction(state, match, tactic, effects)
+    : simulateHalfToEnd(state, match, tactic, effects);
   const after = createSituationSnapshot(state, match);
   const instruction = tactic ? tactic.name : '静観';
   const expectedDelta = tactic ? estimateTacticDelta(match.context, tactic) : 0;
@@ -751,11 +888,13 @@ export function applyMatchInstruction(state, tacticId = 'hold') {
     tacticId: tactic?.id ?? 'hold',
     name: instruction,
     expectedDelta,
-    duration: tactic?.duration ?? 'halfInning',
+    duration: tactic?.duration ?? (advanceMode === 'play' ? 'plateAppearance' : 'halfInning'),
     side: match.situation.offenseIsPlayer ? 'offense' : 'defense',
     before,
-    after,
+    after: createSituationSnapshot(state, match),
     plays: result.plays,
+    completedHalf: match.halfState.outs >= 3 || advanceMode !== 'play',
+    advanceMode,
     effectsText: tactic ? describeEffects(tactic.effects) : '作戦効果なし',
     probabilityText: tactic ? describeProbabilityChange(probabilities) : '確率補正なし',
     cost: tactic?.cost ?? 0
@@ -765,7 +904,13 @@ export function applyMatchInstruction(state, tacticId = 'hold') {
   match.interventionCount += 1;
   match.usedInstructions.push(entry);
   match.lastInstructionResult = entry;
-  match.status = 'result';
+  if (advanceMode === 'game') {
+    if (match.halfState.outs >= 3) advanceHalf(match);
+    simulateRestOfGame(state, match);
+    finalizeCurrentMatchForReview(state, match);
+  } else {
+    match.status = 'result';
+  }
   match.log.unshift(`${before.shortLabel}で${instruction}を選択。${result.runs}点、${result.plays.length}打席。`);
   match.context = createMatchContext(state, match);
   touch(state);
@@ -776,9 +921,16 @@ export function continueMatch(state) {
   const match = state.currentMatch;
   if (!match) throw new Error('進行中の試合がありません。');
   if (match.status === 'result') {
+    const completedHalf = match.lastInstructionResult?.completedHalf !== false;
     match.lastInstructionResult = null;
-    advanceHalf(match);
-    prepareNextDecisionOrFinish(state, match);
+    if (completedHalf) {
+      advanceHalf(match);
+      prepareNextDecisionOrFinish(state, match);
+    } else {
+      match.status = 'selecting';
+      match.situation = createSituationSnapshot(state, match);
+      match.context = createMatchContext(state, match);
+    }
     touch(state);
     return;
   }
@@ -789,18 +941,62 @@ export function continueMatch(state) {
   throw new Error('試合結果を確認してください。');
 }
 
+export function skipCurrentMatch(state) {
+  assertPhase(state, 'match');
+  const match = state.currentMatch;
+  if (!match) throw new Error('進行中の試合がありません。');
+  if (match.status === 'final') return;
+  if (match.skipLocked) throw new Error('試合スキップ処理中です。');
+  match.skipLocked = true;
+  try {
+    if (match.status === 'result') {
+      const completedHalf = match.lastInstructionResult?.completedHalf !== false;
+      match.lastInstructionResult = null;
+      if (completedHalf) advanceHalf(match);
+      prepareNextDecisionOrFinish(state, match);
+    }
+    while (match.status !== 'final') {
+      if (match.status === 'selecting') {
+        applyMatchInstruction(state, 'hold', 'game');
+      } else if (match.status === 'result') {
+        const completedHalf = match.lastInstructionResult?.completedHalf !== false;
+        match.lastInstructionResult = null;
+        if (completedHalf) advanceHalf(match);
+        prepareNextDecisionOrFinish(state, match);
+      } else {
+        simulateRestOfGame(state, match);
+        finalizeCurrentMatchForReview(state, match);
+      }
+    }
+  } finally {
+    match.skipLocked = false;
+  }
+  touch(state);
+}
+
+export function skipNextGame(state) {
+  startNextGame(state);
+  skipCurrentMatch(state);
+}
+
+export function skipNextPostseasonGame(state) {
+  startPostseasonGame(state);
+  skipCurrentMatch(state);
+}
+
 export function confirmMatchResult(state) {
   assertPhase(state, 'match');
   const match = state.currentMatch;
   if (!match || match.status !== 'final' || !match.finalResult) throw new Error('確認できる試合結果がありません。');
   const playerWon = match.finalResult.playerWon;
+  const draw = match.finalResult.draw;
   const combinedEffects = combineUsedInstructionEffects(match);
-  applyPostGameFatigue(state, combinedEffects);
-  awardGameExperience(state, playerWon);
+  applyPostGameFatigue(state, match, combinedEffects);
+  awardGameExperience(state, match, playerWon);
   recordMatchHistory(state, match, playerWon);
 
   if (match.kind === 'postseason') {
-    recordPostseasonResult(state, playerWon, {
+    recordPostseasonResult(state, draw ? null : playerWon, {
       playerScore: match.playerScore,
       opponentScore: match.opponentScore
     });
@@ -814,47 +1010,97 @@ export function confirmMatchResult(state) {
 
 export function recordPostseasonResult(state, playerWon, score = { playerScore: 0, opponentScore: 0 }) {
   if (!state.postseason) throw new Error('ポストシーズン情報がありません。');
+  normalizePostseasonState(state);
   const stage = state.postseason.stage;
-  if (playerWon) state.postseason.playerWins += 1;
+  if (playerWon === null) state.postseason.draws = (state.postseason.draws ?? 0) + 1;
+  else if (playerWon) state.postseason.playerWins += 1;
   else state.postseason.opponentWins += 1;
+  state.postseason.gamesPlayed = (state.postseason.gamesPlayed ?? 0) + 1;
   state.postseason.log.unshift(
-    `${stage === 'cs' ? 'CS' : '日本シリーズ'} ${score.playerScore}-${score.opponentScore} ${
-      playerWon ? '勝利' : '敗戦'
+    `${postseasonStageSettings(stage).label} 第${state.postseason.gamesPlayed}戦 ${score.playerScore}-${score.opponentScore} ${
+      playerWon === null ? '引き分け' : playerWon ? '勝利' : '敗戦'
     }`
   );
 
-  if (stage === 'cs') {
-    if (state.postseason.playerWins >= 2) {
-      const opponent = chooseJapanSeriesOpponent(state);
-      state.postseason = {
-        stage: 'japanSeries',
-        playerWins: 0,
-        opponentWins: 0,
-        opponentId: opponent.id,
-        log: ['CSを突破した。日本シリーズが始まる。']
-      };
-      state.phase = 'postseason';
-      return;
-    }
-    if (state.postseason.opponentWins >= 2) {
-      processSeasonEnd(state, { champion: false, reason: 'CS敗退' });
-      return;
-    }
+  const winner = getPostseasonStageWinner(state.postseason);
+  if (!winner) {
     state.phase = 'postseason';
     return;
   }
 
+  if (stage === 'csFirst') {
+    if (winner === 'player') {
+      const first = getLeagueStandings(state)[0];
+      state.postseason = createPostseasonStage(state, {
+        stage: 'csFinal',
+        opponentId: first.id,
+        highSeed: 'opponent',
+        opponentAdvantageWins: 1,
+        log: ['CSファーストを突破。CSファイナルはリーグ1位に1勝アドバンテージ。']
+      });
+      state.phase = 'postseason';
+      return;
+    }
+    processSeasonEnd(state, { champion: false, reason: 'CSファースト敗退' });
+    return;
+  }
+
+  if (stage === 'csFinal') {
+    if (winner === 'player') {
+      const opponent = chooseJapanSeriesOpponent(state);
+      state.postseason = createPostseasonStage(state, {
+        stage: 'japanSeries',
+        opponentId: opponent.id,
+        highSeed: 'none',
+        log: ['CSを突破した。日本シリーズが始まる。']
+      });
+      state.phase = 'postseason';
+      return;
+    }
+    processSeasonEnd(state, { champion: false, reason: 'CSファイナル敗退' });
+    return;
+  }
+
   if (stage === 'japanSeries') {
-    if (state.postseason.playerWins >= 4) {
+    if (winner === 'player') {
       processSeasonEnd(state, { champion: true, reason: '日本一' });
       return;
     }
-    if (state.postseason.opponentWins >= 4) {
-      processSeasonEnd(state, { champion: false, reason: '日本シリーズ敗退' });
-      return;
-    }
-    state.phase = 'postseason';
+    processSeasonEnd(state, { champion: false, reason: '日本シリーズ敗退' });
   }
+}
+
+function normalizePostseasonState(state) {
+  if (!state.postseason) return;
+  if (state.postseason.stage === 'cs') {
+    state.postseason.stage = 'csFirst';
+  }
+  const settings = postseasonStageSettings(state.postseason.stage);
+  state.postseason.stageLabel = state.postseason.stageLabel ?? settings.label;
+  state.postseason.maxGames = state.postseason.maxGames ?? settings.maxGames;
+  state.postseason.winsToAdvance = state.postseason.winsToAdvance ?? settings.winsToAdvance;
+  state.postseason.gamesPlayed = state.postseason.gamesPlayed ?? (state.postseason.playerWins ?? 0) + (state.postseason.opponentWins ?? 0) + (state.postseason.draws ?? 0);
+  state.postseason.draws = state.postseason.draws ?? 0;
+  state.postseason.playerAdvantageWins = state.postseason.playerAdvantageWins ?? 0;
+  state.postseason.opponentAdvantageWins = state.postseason.opponentAdvantageWins ?? 0;
+  state.postseason.highSeed = state.postseason.highSeed ?? 'opponent';
+  state.postseason.log = state.postseason.log ?? [];
+}
+
+function getPostseasonStageWinner(postseason) {
+  const playerTotal = postseason.playerWins + (postseason.playerAdvantageWins ?? 0);
+  const opponentTotal = postseason.opponentWins + (postseason.opponentAdvantageWins ?? 0);
+  const remaining = Math.max(0, postseason.maxGames - (postseason.gamesPlayed ?? 0));
+  if (playerTotal >= postseason.winsToAdvance) return 'player';
+  if (opponentTotal >= postseason.winsToAdvance) return 'opponent';
+  if (playerTotal > opponentTotal + remaining) return 'player';
+  if (opponentTotal > playerTotal + remaining) return 'opponent';
+  if ((postseason.gamesPlayed ?? 0) >= postseason.maxGames) {
+    if (playerTotal > opponentTotal) return 'player';
+    if (opponentTotal > playerTotal) return 'opponent';
+    return postseason.highSeed === 'player' ? 'player' : 'opponent';
+  }
+  return null;
 }
 
 export function rollRewardRarity(rng, tier = 'light') {
@@ -995,8 +1241,11 @@ export function performOffseasonAction(state, action, targetPlayerId = null) {
     state.offseason.log.unshift('視察で次回ドラフト情報を厚くした。');
   } else if (action === 'coach') {
     const target = state.roster.find((player) => player.id === targetPlayerId) ?? bestYoungPlayer(state);
-    improvePlayer(target, Math.max(1, Math.round(5 * efficiency)), state.rng);
-    state.offseason.log.unshift(`${target.name}を直接指導した。`);
+    const amount = Math.max(1, Math.round(CONFIG.development.directCoachBase * efficiency));
+    const report = improvePlayer(target, amount, state.rng, state.year, '直接指導');
+    const detail = summarizeGrowthReport(report);
+    state.offseason.lastCoachResult = { playerId: target.id, playerName: target.name, detail };
+    state.offseason.log.unshift(`${target.name}を直接指導した。${detail}`);
   }
   touch(state);
 }
@@ -1010,6 +1259,7 @@ export function beginNextYearDraft(state) {
   state.funds += 85 + getLegacyPerkLevel(state, 'legacy-funds') * 20 - (hasHardCondition(state, 'funds-down') ? 35 : 0);
   resetSeasonPlayerStats(state);
   ensureRosterDepth(state);
+  ensureRosterPlan(state);
   markSeasonBaseline(state, '年度開始時点');
   state.awards = null;
   state.offseason = null;
@@ -1121,7 +1371,7 @@ function migrateGameState(state) {
   state.matchHistory = state.matchHistory ?? [];
   state.seasonLog = state.seasonLog ?? [];
   for (const player of state.roster ?? []) {
-    player.history = player.history ?? [];
+    normalizePlayerRosterFields(player);
     player.stats = player.stats ?? createStats(player.role);
     if (!player.seasonBaseline) {
       player.seasonBaseline = {
@@ -1134,6 +1384,7 @@ function migrateGameState(state) {
   if (state.draft?.pool) {
     for (const candidate of state.draft.pool) {
       candidate.abilityRanges = candidate.abilityRanges ?? createAbilityRanges(candidate.abilities, state.modifiers.scoutAccuracyBonus ?? 0);
+      candidate.defensePositions = candidate.role === 'hitter' ? normalizeDefensePositions(candidate) : [];
       candidate.scoutReport =
         candidate.scoutReport ??
         createDraftScoutReport({
@@ -1142,6 +1393,20 @@ function migrateGameState(state) {
           potentialRange: candidate.potentialRange
         });
     }
+  }
+  ensureRosterDepth(state);
+  ensureRosterPlan(state);
+  if (state.postseason?.stage === 'cs') {
+    state.postseason = {
+      ...createPostseasonStage(state, {
+        stage: 'csFirst',
+        opponentId: state.postseason.opponentId,
+        highSeed: getPlayerRank(state) <= 2 ? 'player' : 'opponent',
+        log: state.postseason.log ?? ['旧CSデータをファーストステージとして移行した。']
+      }),
+      playerWins: state.postseason.playerWins ?? 0,
+      opponentWins: state.postseason.opponentWins ?? 0
+    };
   }
   if (state.phase === 'match' && state.currentMatch) {
     normalizeCurrentMatch(state);
@@ -1158,8 +1423,10 @@ function chooseRegularOpponent(state) {
 function createMatch(state, { kind, opponentId, opponentName, opponentRating }) {
   const lineup = selectLineup(state);
   const pitcher = selectPitcher(state);
+  const opponentPitchers = createOpponentPitchingStaff(state, opponentName, opponentRating);
   const statBaselines = createStatBaselines(state.roster);
-  markGameAppearances(lineup, pitcher);
+  markGameAppearances(lineup);
+  pitcher.stats.games += 1;
   const match = {
     id: makeId('match', state.rng),
     kind,
@@ -1176,7 +1443,14 @@ function createMatch(state, { kind, opponentId, opponentName, opponentRating }) 
     hitterIndex: 0,
     opponentBatterIndex: 0,
     lineupIds: lineup.map((player) => player.id),
+    lineupSlots: state.rosterPlan.lineup.map((slot) => ({ ...slot })),
     pitcherId: pitcher.id,
+    scheduledStarterId: pitcher.id,
+    usedPitcherIds: [pitcher.id],
+    pitchingLog: [createPitchingLogEntry(pitcher, 1, '先発')],
+    opponentPitchers,
+    opponentPitcherIndex: 0,
+    opponentPitchingLog: [createOpponentPitchingLogEntry(opponentPitchers[0], 1)],
     statBaselines,
     managerPoints: getManagerPoints(state),
     interventionCount: 0,
@@ -1206,7 +1480,14 @@ function normalizeCurrentMatch(state) {
   match.hitterIndex = match.hitterIndex ?? 0;
   match.opponentBatterIndex = match.opponentBatterIndex ?? 0;
   match.lineupIds = match.lineupIds ?? lineup.map((player) => player.id);
+  match.lineupSlots = match.lineupSlots ?? (state.rosterPlan?.lineup ?? []).map((slot) => ({ ...slot }));
   match.pitcherId = pitcher.id;
+  match.scheduledStarterId = match.scheduledStarterId ?? pitcher.id;
+  match.usedPitcherIds = match.usedPitcherIds ?? [pitcher.id];
+  match.pitchingLog = match.pitchingLog ?? [createPitchingLogEntry(pitcher, 1, pitcher.position ?? '先発')];
+  match.opponentPitchers = match.opponentPitchers ?? createOpponentPitchingStaff(state, match.opponentName, match.opponentRating);
+  match.opponentPitcherIndex = match.opponentPitcherIndex ?? 0;
+  match.opponentPitchingLog = match.opponentPitchingLog ?? [createOpponentPitchingLogEntry(currentOpponentPitcher(match), 1)];
   match.interventionCount = match.interventionCount ?? 0;
   match.usedInstructions = match.usedInstructions ?? [];
   match.status = match.status ?? 'selecting';
@@ -1272,18 +1553,20 @@ function isMatchFinished(match) {
 }
 
 function finalizeCurrentMatchForReview(state, match) {
-  if (match.playerScore === match.opponentScore) {
+  if (match.kind !== 'postseason' && match.playerScore === match.opponentScore) {
     if (teamPower(state).overall >= match.opponentRating) match.playerScore += 1;
     else match.opponentScore += 1;
   }
   const playerWon = match.playerScore > match.opponentScore;
+  const draw = match.playerScore === match.opponentScore;
   match.status = 'final';
   match.situation = null;
   match.finalResult = {
     playerWon,
+    draw,
     playerScore: match.playerScore,
     opponentScore: match.opponentScore,
-    summary: `${match.opponentName}戦は${match.playerScore}-${match.opponentScore}で${playerWon ? '勝利' : '敗戦'}。`,
+    summary: `${match.opponentName}戦は${match.playerScore}-${match.opponentScore}で${draw ? '引き分け' : playerWon ? '勝利' : '敗戦'}。`,
     keyStats: createMatchKeyStats(state, match),
     instructions: match.usedInstructions
   };
@@ -1304,19 +1587,33 @@ function simulateHalfToEnd(state, match, tactic, effects) {
   };
 }
 
+function simulateSinglePlayForInstruction(state, match, tactic, effects) {
+  const startScore = { player: match.playerScore, opponent: match.opponentScore };
+  const activeEffects = tactic ? effects : {};
+  const plays = match.halfState.outs < 3 ? [simulatePlateAppearance(state, match, activeEffects)] : [];
+  return {
+    plays,
+    runs: match.playerScore - startScore.player + match.opponentScore - startScore.opponent
+  };
+}
+
 function simulatePlateAppearance(state, match, effects) {
   const before = createSituationSnapshot(state, match);
   if (match.half === 'top') {
+    maybeChangeOpponentPitcher(state, match);
     const lineup = getLineupPlayers(state, match);
     const batter = lineup[match.hitterIndex % lineup.length];
     match.hitterIndex += 1;
-    const outcome = rollPlayerBattingOutcome(state, batter, match.opponentRating, effects);
+    const opponentPitcher = currentOpponentPitcher(match);
+    const outcome = rollPlayerBattingOutcome(state, batter, opponentPitcher.rating, effects);
     const play = applyBattingOutcomeByIds(state, match.halfState.bases, batter, outcome);
     match.halfState.outs += play.outs;
     match.playerScore += play.runs;
+    updateOpponentPitchingLine(match, outcome, play);
     return createPlaySummary(before, createSituationSnapshot(state, match), batter.name, outcome, play.runs, play.outs);
   }
 
+  maybeChangePlayerPitcher(state, match);
   const pitcher = state.roster.find((player) => player.id === match.pitcherId) ?? selectPitcher(state);
   const batterName = `相手${(match.opponentBatterIndex % 9) + 1}番`;
   match.opponentBatterIndex += 1;
@@ -1326,6 +1623,7 @@ function simulatePlateAppearance(state, match, effects) {
   match.opponentScore += play.runs;
   pitcher.stats.er += play.runs;
   pitcher.stats.outs += play.outs;
+  updatePlayerPitchingLine(match, outcome, play);
   return createPlaySummary(before, createSituationSnapshot(state, match), batterName, outcome, play.runs, play.outs);
 }
 
@@ -1425,7 +1723,7 @@ function createSituationSnapshot(state, match) {
   const lineup = getLineupPlayers(state, match);
   const batter = offenseIsPlayer ? lineup[match.hitterIndex % lineup.length]?.name ?? '打者未定' : `相手${(match.opponentBatterIndex % 9) + 1}番`;
   const pitcher = offenseIsPlayer
-    ? `${match.opponentName}先発`
+    ? currentOpponentPitcher(match).name
     : state.roster.find((player) => player.id === match.pitcherId)?.name ?? '投手未定';
   const bases = match.halfState.bases.map(Boolean);
   const halfLabel = match.half === 'top' ? '表' : '裏';
@@ -1467,10 +1765,11 @@ function estimateCurrentProbabilities(state, match, effects) {
   if (match.situation.offenseIsPlayer) {
     const lineup = getLineupPlayers(state, match);
     const batter = lineup[match.hitterIndex % lineup.length];
+    const opponentPitcher = currentOpponentPitcher(match);
     return {
       kind: 'offense',
-      before: playerOutcomeRates(state, batter, match.opponentRating, {}),
-      after: playerOutcomeRates(state, batter, match.opponentRating, effects)
+      before: playerOutcomeRates(state, batter, opponentPitcher.rating, {}),
+      after: playerOutcomeRates(state, batter, opponentPitcher.rating, effects)
     };
   }
   const pitcher = state.roster.find((player) => player.id === match.pitcherId) ?? selectPitcher(state);
@@ -1557,23 +1856,13 @@ function createMatchKeyStats(state, match) {
     .sort((a, b) => b.rbi - a.rbi || b.h - a.h)
     .slice(0, 3)
     .map((entry) => `${entry.player.name}: ${entry.h}安打 ${entry.hr}本 ${entry.rbi}打点`);
-  const pitcher = state.roster
-    .filter((player) => player.role === 'pitcher')
-    .sort((a, b) => {
-      const aBase = match.statBaselines?.[a.id] ?? {};
-      const bBase = match.statBaselines?.[b.id] ?? {};
-      return (b.stats.outs - (bBase.outs ?? 0)) - (a.stats.outs - (aBase.outs ?? 0));
-    })[0];
-  const pitching = pitcher
-    ? (() => {
-        const base = match.statBaselines?.[pitcher.id] ?? {};
-        const outs = (pitcher.stats.outs ?? 0) - (base.outs ?? 0);
-        const so = (pitcher.stats.so ?? 0) - (base.so ?? 0);
-        const er = (pitcher.stats.er ?? 0) - (base.er ?? 0);
-        return [`${pitcher.name}: ${formatInningsForSummary(outs)}回 ${so}奪三振 ${er}自責点`];
-      })()
-    : [];
-  return [...hitters, ...pitching].filter(Boolean);
+  const pitching = (match.pitchingLog ?? [])
+    .filter((entry) => entry.outs > 0 || entry.er > 0)
+    .map((entry) => `${entry.order}. ${entry.name}(${entry.role}): ${formatInningsForSummary(entry.outs)}回 ${entry.so}奪三振 ${entry.er}失点`);
+  const opponentPitching = (match.opponentPitchingLog ?? [])
+    .filter((entry) => entry.outs > 0 || entry.er > 0)
+    .map((entry) => `相手${entry.order}. ${entry.name}: ${formatInningsForSummary(entry.outs)}回 ${entry.er}失点`);
+  return [...hitters, ...pitching, ...opponentPitching].filter(Boolean);
 }
 
 function formatInningsForSummary(outs) {
@@ -1583,24 +1872,37 @@ function formatInningsForSummary(outs) {
 }
 
 function selectLineup(state) {
-  const training = getTrainingEffects(state);
-  return state.roster
-    .filter((player) => player.role === 'hitter')
-    .sort((a, b) => hitterScore(b, training) - hitterScore(a, training))
-    .slice(0, 9);
+  ensureRosterDepth(state);
+  ensureRosterPlan(state);
+  const players = state.rosterPlan.lineup
+    .map((slot) => state.roster.find((player) => player.id === slot.playerId && player.role === 'hitter'))
+    .filter(Boolean);
+  if (players.length === LINEUP_POSITIONS.length) return players;
+  state.rosterPlan = createDefaultRosterPlan(state);
+  return state.rosterPlan.lineup
+    .map((slot) => state.roster.find((player) => player.id === slot.playerId && player.role === 'hitter'))
+    .filter(Boolean);
 }
 
 function selectPitcher(state) {
-  const training = getTrainingEffects(state);
-  const pitchers = state.roster
-    .filter((player) => player.role === 'pitcher')
-    .sort((a, b) => pitcherScore(b, training) - pitcherScore(a, training) || a.fatigue - b.fatigue);
-  return pitchers[0];
+  ensureRosterDepth(state);
+  ensureRosterPlan(state);
+  const rotation = state.rosterPlan.rotation
+    .map((id) => state.roster.find((player) => player.id === id && player.role === 'pitcher' && player.position === '先発'))
+    .filter(Boolean);
+  if (!rotation.length) {
+    state.rosterPlan = createDefaultRosterPlan(state);
+    return selectPitcher(state);
+  }
+  const startIndex = state.rosterPlan.nextStarterIndex % rotation.length;
+  const ordered = rotation.slice(startIndex).concat(rotation.slice(0, startIndex));
+  const scheduled = ordered.find((player) => (player.fatigue ?? 0) <= CONFIG.match.starterFatigueLimit) ?? ordered.sort((a, b) => (a.fatigue ?? 0) - (b.fatigue ?? 0))[0];
+  state.rosterPlan.nextStarterIndex = (rotation.findIndex((player) => player.id === scheduled.id) + 1) % rotation.length;
+  return scheduled;
 }
 
-function markGameAppearances(lineup, pitcher) {
+function markGameAppearances(lineup) {
   for (const player of lineup) player.stats.games += 1;
-  pitcher.stats.games += 1;
 }
 
 function createStatBaselines(roster) {
@@ -1617,6 +1919,160 @@ function createStatBaselines(roster) {
       }
     ])
   );
+}
+
+function createPitchingLogEntry(player, order, role) {
+  return {
+    playerId: player.id,
+    name: player.name,
+    role,
+    order,
+    outs: 0,
+    er: 0,
+    h: 0,
+    bb: 0,
+    so: 0
+  };
+}
+
+function createOpponentPitchingStaff(state, opponentName, baseRating) {
+  return [
+    { id: 'opp-starter', name: `${opponentName}先発`, role: '先発', rating: baseRating + randomInt(state.rng, -3, 3), stamina: 72 },
+    { id: 'opp-relief-1', name: `${opponentName}中継ぎA`, role: '中継ぎ', rating: baseRating + randomInt(state.rng, -4, 4), stamina: 42 },
+    { id: 'opp-relief-2', name: `${opponentName}中継ぎB`, role: '中継ぎ', rating: baseRating + randomInt(state.rng, -4, 4), stamina: 38 },
+    { id: 'opp-closer', name: `${opponentName}抑え`, role: '抑え', rating: baseRating + randomInt(state.rng, -2, 5), stamina: 28 }
+  ];
+}
+
+function createOpponentPitchingLogEntry(pitcher, order) {
+  return {
+    pitcherId: pitcher.id,
+    name: pitcher.name,
+    role: pitcher.role,
+    order,
+    outs: 0,
+    er: 0,
+    h: 0,
+    bb: 0,
+    so: 0
+  };
+}
+
+function currentPitchingLog(match) {
+  return match.pitchingLog?.find((entry) => entry.playerId === match.pitcherId);
+}
+
+function currentOpponentPitcher(match) {
+  return match.opponentPitchers?.[match.opponentPitcherIndex ?? 0] ?? { id: 'opp-starter', name: `${match.opponentName}先発`, role: '先発', rating: match.opponentRating, stamina: 70 };
+}
+
+function currentOpponentPitchingLog(match) {
+  const pitcher = currentOpponentPitcher(match);
+  return match.opponentPitchingLog?.find((entry) => entry.pitcherId === pitcher.id);
+}
+
+function updatePlayerPitchingLine(match, outcome, play) {
+  const line = currentPitchingLog(match);
+  if (!line) return;
+  line.outs += play.outs;
+  line.er += play.runs;
+  if (['single', 'double', 'triple', 'hr'].includes(outcome)) line.h += 1;
+  if (outcome === 'bb') line.bb += 1;
+  if (outcome === 'so') line.so += 1;
+}
+
+function updateOpponentPitchingLine(match, outcome, play) {
+  const line = currentOpponentPitchingLog(match);
+  if (!line) return;
+  line.outs += play.outs;
+  line.er += play.runs;
+  if (['single', 'double', 'triple', 'hr'].includes(outcome)) line.h += 1;
+  if (outcome === 'bb') line.bb += 1;
+  if (outcome === 'so') line.so += 1;
+}
+
+function maybeChangePlayerPitcher(state, match) {
+  const current = state.roster.find((player) => player.id === match.pitcherId);
+  const line = currentPitchingLog(match);
+  if (!current || !line) return;
+  if (!shouldChangePitcher(match, line, current)) return;
+  const next = chooseReliefPitcher(state, match);
+  if (!next || next.id === current.id) return;
+  enterPlayerPitcher(match, next);
+}
+
+function shouldChangePitcher(match, line, pitcher) {
+  const fatigueLoad = line.outs + line.h * 2 + line.bb + line.er * 3;
+  const stamina = pitcher.abilities.stamina ?? 55;
+  const effectiveStamina = stamina - (pitcher.fatigue ?? 0) * 0.6;
+  const scoreDiff = match.playerScore - match.opponentScore;
+  if (line.role === '先発') {
+    if (line.outs < CONFIG.match.starterMinOutsForHook && line.er < CONFIG.match.starterHookRuns + 2) return false;
+    if (line.er >= CONFIG.match.starterHookRuns && line.outs >= 9) return true;
+    if (match.inning >= 7 && fatigueLoad > effectiveStamina * 0.42) return true;
+    if (match.inning >= 9 && scoreDiff > 0 && scoreDiff <= CONFIG.match.closerLeadMax) return true;
+    return fatigueLoad > effectiveStamina * 0.58;
+  }
+  if (line.role === '中継ぎ') {
+    if (match.inning >= CONFIG.match.closerStartInning && scoreDiff > 0 && scoreDiff <= CONFIG.match.closerLeadMax) return true;
+    return fatigueLoad > Math.max(10, effectiveStamina * 0.35) || line.er >= 3;
+  }
+  return fatigueLoad > Math.max(8, effectiveStamina * 0.3) || line.er >= 3;
+}
+
+function chooseReliefPitcher(state, match) {
+  ensureRosterPlan(state);
+  const used = new Set(match.usedPitcherIds ?? []);
+  const scoreDiff = match.playerScore - match.opponentScore;
+  const closer = state.roster.find((player) => player.id === state.rosterPlan.bullpen?.closerId && player.position === '抑え');
+  if (
+    closer &&
+    !used.has(closer.id) &&
+    match.inning >= CONFIG.match.closerStartInning &&
+    scoreDiff > 0 &&
+    scoreDiff <= CONFIG.match.closerLeadMax
+  ) {
+    return closer;
+  }
+  const relievers = (state.rosterPlan.bullpen?.relievers ?? [])
+    .map((id) => state.roster.find((player) => player.id === id && player.position === '中継ぎ'))
+    .filter(Boolean)
+    .filter((player) => !used.has(player.id))
+    .sort((a, b) => (a.fatigue ?? 0) - (b.fatigue ?? 0) || pitcherScore(b, getTrainingEffects(state)) - pitcherScore(a, getTrainingEffects(state)));
+  if (relievers.length) return relievers[0];
+  if (closer && !used.has(closer.id)) return closer;
+  return null;
+}
+
+function enterPlayerPitcher(match, pitcher) {
+  match.pitcherId = pitcher.id;
+  match.usedPitcherIds = [...new Set([...(match.usedPitcherIds ?? []), pitcher.id])];
+  pitcher.stats.games += 1;
+  match.pitchingLog.push(createPitchingLogEntry(pitcher, match.pitchingLog.length + 1, pitcher.position));
+  match.log.unshift(`${match.inning}回${match.half === 'top' ? '表' : '裏'}、${pitcher.name}へ継投。`);
+}
+
+function maybeChangeOpponentPitcher(state, match) {
+  const line = currentOpponentPitchingLog(match);
+  if (!line) return;
+  const pitcher = currentOpponentPitcher(match);
+  const lead = match.opponentScore - match.playerScore;
+  const fatigueLoad = line.outs + line.h * 2 + line.bb + line.er * 3;
+  const shouldUseCloser = match.inning >= CONFIG.match.closerStartInning && lead > 0 && lead <= CONFIG.match.closerLeadMax;
+  const shouldChange =
+    (pitcher.role === '先発' && (line.er >= CONFIG.match.starterHookRuns || fatigueLoad > pitcher.stamina * 0.55 || match.inning >= 8)) ||
+    (pitcher.role === '中継ぎ' && (line.er >= 3 || fatigueLoad > pitcher.stamina * 0.45 || shouldUseCloser));
+  if (!shouldChange && !shouldUseCloser) return;
+  const nextIndex = shouldUseCloser
+    ? match.opponentPitchers.findIndex((entry) => entry.role === '抑え')
+    : match.opponentPitcherIndex + 1;
+  if (nextIndex <= match.opponentPitcherIndex || nextIndex >= match.opponentPitchers.length) return;
+  match.opponentPitcherIndex = nextIndex;
+  const next = currentOpponentPitcher(match);
+  if (!match.opponentPitchingLog.some((entry) => entry.pitcherId === next.id)) {
+    match.opponentPitchingLog.push(createOpponentPitchingLogEntry(next, match.opponentPitchingLog.length + 1));
+  }
+  match.log.unshift(`${match.inning}回${match.half === 'top' ? '表' : '裏'}、相手が${next.name}へ継投。`);
 }
 
 function simulateInning(state, lineup, pitcher, opponent, effects, hitterIndex) {
@@ -1856,24 +2312,38 @@ function estimateTacticDelta(context, tactic) {
   return Math.round(delta * 100) / 100;
 }
 
-function applyPostGameFatigue(state, effects) {
+function applyPostGameFatigue(state, match, effects) {
   const fatigueHard = hasHardCondition(state, 'fatigue-up') ? 1 : 0;
+  const pitchedOuts = Object.fromEntries((match.pitchingLog ?? []).map((entry) => [entry.playerId, entry.outs]));
+  const activeHitters = new Set(match.lineupIds ?? []);
   for (const player of state.roster) {
     const durability = player.abilities.durability ?? 55;
-    const baseFatigue = player.role === 'pitcher' ? 2 : 1;
+    const pitched = pitchedOuts[player.id] ?? 0;
+    const baseFatigue = player.role === 'pitcher'
+      ? (pitched > 0 ? Math.ceil(pitched / 3) + (pitched >= 18 ? 3 : 1) : -2)
+      : (activeHitters.has(player.id) ? 1 : -1);
     const tacticFatigue =
       player.role === 'pitcher' ? effects.fatiguePitchers ?? 0 : effects.fatigueHitters ?? 0;
-    player.fatigue = clamp(player.fatigue + baseFatigue + fatigueHard + tacticFatigue - Math.floor(durability / 45), 0, 80);
+    player.fatigue = clamp(player.fatigue + baseFatigue + fatigueHard + tacticFatigue - Math.floor(durability / 50), 0, 80);
     player.condition = clamp(player.condition + randomInt(state.rng, -1, 1), -10, 10);
   }
 }
 
-function awardGameExperience(state, playerWon) {
+function awardGameExperience(state, match, playerWon) {
   const training = getTrainingEffects(state);
+  const activeIds = new Set([...(match.lineupIds ?? []), ...(match.pitchingLog ?? []).map((entry) => entry.playerId)]);
+  const growthEntries = [];
   for (const player of state.roster) {
     const youth = player.age <= 24 ? 1 + (training.youthGrowth ?? 0) + (state.manager.abilities['farm-system'] ?? 0) * 0.12 : 1;
-    const activeBonus = player.stats.games > 0 ? 1 : 0.35;
-    player.xp += Math.round((playerWon ? 3 : 2) * youth * activeBonus);
+    const activeBonus = activeIds.has(player.id) ? CONFIG.development.activeMultiplier : CONFIG.development.reserveMultiplier;
+    const gainedXp = Math.max(1, Math.round((playerWon ? 3 : 2) * youth * activeBonus));
+    player.xp += gainedXp;
+    const growth = applyInSeasonGrowth(state, player, training, activeBonus);
+    if (growth.length) growthEntries.push(...growth.map((entry) => `${player.name}: ${entry.label}+${entry.amount}`));
+  }
+  if (growthEntries.length) {
+    match.growthResults = growthEntries;
+    state.seasonLog.unshift(`試合経験で成長: ${growthEntries.slice(0, 3).join(' / ')}${growthEntries.length > 3 ? ' ほか' : ''}`);
   }
 }
 
@@ -1887,6 +2357,7 @@ function recordMatchHistory(state, match, playerWon) {
     playerScore: match.playerScore,
     opponentScore: match.opponentScore,
     playerWon,
+    draw: match.playerScore === match.opponentScore,
     instruction: match.selectedInstruction,
     expectedDelta: match.expectedDelta,
     instructions: match.usedInstructions ?? [],
@@ -1943,23 +2414,76 @@ function finishRegularSeason(state) {
   const rank = getPlayerRank(state);
   const cutoff = hasHardCondition(state, 'rank-demand') ? 2 : CONFIG.season.playoffRankCutoff;
   if (rank <= cutoff) {
-    const opponent = chooseCsOpponent(state);
-    state.postseason = {
-      stage: 'cs',
-      playerWins: 0,
-      opponentWins: 0,
-      opponentId: opponent.id,
-      log: [`リーグ${rank}位でCSへ進出した。`]
-    };
+    state.postseason = createClimaxSeriesState(state, rank);
     state.phase = 'postseason';
   } else {
     processSeasonEnd(state, { champion: false, reason: `リーグ${rank}位でCS進出ならず` });
   }
 }
 
-function chooseCsOpponent(state) {
-  const standings = getLeagueStandings(state).filter((team) => team.id !== state.teamId);
-  return standings[0] ?? state.teams.find((team) => team.id !== state.teamId);
+function createClimaxSeriesState(state, rank) {
+  const standings = getLeagueStandings(state);
+  if (rank === 1) {
+    const opponent = simulateCsFirstForNpc(state, standings);
+    return createPostseasonStage(state, {
+      stage: 'csFinal',
+      opponentId: opponent.id,
+      highSeed: 'player',
+      playerAdvantageWins: 1,
+      opponentAdvantageWins: 0,
+      log: [`リーグ1位でCSファイナルへ進出。1勝アドバンテージを得た。`]
+    });
+  }
+  const opponent = standings.find((team, index) => index < 3 && team.id !== state.teamId) ?? standings[0];
+  return createPostseasonStage(state, {
+    stage: 'csFirst',
+    opponentId: opponent.id,
+    highSeed: rank === 2 ? 'player' : 'opponent',
+    playerAdvantageWins: 0,
+    opponentAdvantageWins: 0,
+    log: [`リーグ${rank}位でCSファーストへ進出した。`]
+  });
+}
+
+function createPostseasonStage(_state, { stage, opponentId, highSeed, playerAdvantageWins = 0, opponentAdvantageWins = 0, log = [] }) {
+  const settings = postseasonStageSettings(stage);
+  return {
+    stage,
+    stageLabel: settings.label,
+    playerWins: 0,
+    opponentWins: 0,
+    draws: 0,
+    gamesPlayed: 0,
+    maxGames: settings.maxGames,
+    winsToAdvance: settings.winsToAdvance,
+    playerAdvantageWins,
+    opponentAdvantageWins,
+    highSeed,
+    opponentId,
+    log
+  };
+}
+
+function postseasonStageSettings(stage) {
+  if (stage === 'csFirst') return { label: 'CSファーストステージ', maxGames: 3, winsToAdvance: 2 };
+  if (stage === 'csFinal') return { label: 'CSファイナルステージ', maxGames: 6, winsToAdvance: 4 };
+  return { label: '日本シリーズ', maxGames: 7, winsToAdvance: 4 };
+}
+
+function simulateCsFirstForNpc(state, standings) {
+  const second = standings[1];
+  const third = standings[2];
+  if (!second || !third) return standings.find((team) => team.id !== state.teamId);
+  let secondWins = 0;
+  let thirdWins = 0;
+  for (let game = 0; game < 3; game += 1) {
+    const secondChance = clamp(0.5 + (second.rating - third.rating) * 0.012, 0.3, 0.72);
+    if (chance(state.rng, secondChance)) secondWins += 1;
+    else thirdWins += 1;
+    const remaining = 2 - game;
+    if (secondWins >= 2 || thirdWins >= 2 || secondWins >= thirdWins + remaining) break;
+  }
+  return thirdWins > secondWins ? third : second;
 }
 
 function chooseJapanSeriesOpponent(state) {
@@ -2156,6 +2680,25 @@ function calculateGrowthAmount(state, player, training, ageBeforeBirthday) {
   return Math.min(5, Math.round((1 + player.xp / 40 + potentialGap / 35) * ageFactor * youthTraining * manager));
 }
 
+function applyInSeasonGrowth(state, player, training, activeBonus) {
+  const peak = growthPeak(player.growthType);
+  const potentialGap = Math.max(0, player.potential - playerOverall(player));
+  if (potentialGap <= 0 || player.age > peak + 2) return [];
+  const ageFactor = player.age <= 23 ? 1.3 : player.age <= peak ? 0.9 : 0.45;
+  const youthTraining = player.age <= 24 ? 1 + (training.youthGrowth ?? 0) : 1;
+  const manager = 1 + (state.manager.abilities['farm-system'] ?? 0) * 0.1;
+  player.growthProgress = (player.growthProgress ?? 0) + CONFIG.development.inSeasonBase * activeBonus * ageFactor * youthTraining * manager * (0.55 + potentialGap / 60);
+  const gained = [];
+  let safety = 0;
+  while (player.growthProgress >= 1 && safety < 2 && playerOverall(player) < player.potential) {
+    player.growthProgress -= 1;
+    const report = improvePlayer(player, 1, state.rng, state.year, '試合経験');
+    gained.push(...report);
+    safety += 1;
+  }
+  return gained;
+}
+
 function calculateDeclineAmount(state, player, training, ageBeforeBirthday) {
   if (state.modifiers.preventDeclineThisSeason) return 0;
   const peak = growthPeak(player.growthType);
@@ -2173,13 +2716,25 @@ function growthPeak(growthType) {
   return 27;
 }
 
-function improvePlayer(player, amount, rng) {
+function improvePlayer(player, amount, rng, year = null, reason = '成長') {
   const keys = Object.keys(player.abilities);
+  const changes = [];
   for (let count = 0; count < amount; count += 1) {
     const key = pick(rng, keys);
     player.abilities[key] = clamp(player.abilities[key] + 1, 1, 100);
+    changes.push({ key, label: abilityLabelForRole(player.role, key), amount: 1 });
   }
   player.xp = Math.max(0, player.xp - amount * 5);
+  if (year !== null && changes.length) {
+    player.growthLog = player.growthLog ?? [];
+    player.growthLog.unshift({
+      year,
+      reason,
+      changes
+    });
+    player.growthLog = player.growthLog.slice(0, 12);
+  }
+  return changes;
 }
 
 function declinePlayer(player, amount, rng) {
@@ -2188,6 +2743,15 @@ function declinePlayer(player, amount, rng) {
     const key = pick(rng, keys);
     player.abilities[key] = clamp(player.abilities[key] - 1, 1, 100);
   }
+}
+
+function summarizeGrowthReport(report) {
+  if (!report.length) return '成長なし';
+  const totals = {};
+  for (const entry of report) {
+    totals[entry.label] = (totals[entry.label] ?? 0) + entry.amount;
+  }
+  return Object.entries(totals).map(([label, amount]) => `${label}+${amount}`).join(' / ');
 }
 
 function expireTemporaryPlayers(state) {
@@ -2225,14 +2789,149 @@ function resetTeamRecords(state) {
 }
 
 function ensureRosterDepth(state) {
+  state.roster = state.roster ?? [];
+  for (const player of state.roster) normalizePlayerRosterFields(player);
+
+  for (const position of FIELD_POSITIONS) {
+    if (!state.roster.some((player) => player.role === 'hitter' && normalizeDefensePositions(player).includes(position))) {
+      state.roster.push(generatePlayer(state.rng, 'hitter', randomInt(state.rng, 24, 31), false, { position }));
+    }
+  }
+
   const hitters = state.roster.filter((player) => player.role === 'hitter').length;
-  const pitchers = state.roster.filter((player) => player.role === 'pitcher').length;
   for (let count = hitters; count < CONFIG.roster.minimumHitters; count += 1) {
-    state.roster.push(generatePlayer(state.rng, 'hitter', randomInt(state.rng, 24, 31), false));
+    state.roster.push(generatePlayer(state.rng, 'hitter', randomInt(state.rng, 24, 31), false, { position: count === hitters ? '代打' : pick(state.rng, HITTER_POSITIONS) }));
   }
-  for (let count = pitchers; count < CONFIG.roster.minimumPitchers; count += 1) {
-    state.roster.push(generatePlayer(state.rng, 'pitcher', randomInt(state.rng, 24, 31), false));
+
+  const roleRequirements = [
+    ['先発', CONFIG.roster.starterSlots],
+    ['中継ぎ', CONFIG.roster.relieverSlots],
+    ['抑え', 1]
+  ];
+  for (const [position, needed] of roleRequirements) {
+    const current = state.roster.filter((player) => player.role === 'pitcher' && player.position === position).length;
+    for (let count = current; count < needed; count += 1) {
+      state.roster.push(generatePlayer(state.rng, 'pitcher', randomInt(state.rng, 24, 31), false, { position }));
+    }
   }
+}
+
+function normalizePlayerRosterFields(player) {
+  player.history = player.history ?? [];
+  player.growthLog = player.growthLog ?? [];
+  player.growthProgress = player.growthProgress ?? 0;
+  if (player.role === 'hitter') {
+    player.defensePositions = normalizeDefensePositions(player);
+    if (!LINEUP_POSITIONS.includes(player.position) && player.position !== '代打' && player.position !== '外野手') {
+      player.position = player.defensePositions[0] ?? '一塁手';
+    }
+  } else if (player.role === 'pitcher' && !PITCHER_POSITIONS.includes(player.position)) {
+    player.position = '中継ぎ';
+  }
+}
+
+function normalizeDefensePositions(player) {
+  if (player.role !== 'hitter') return [];
+  const raw = player.defensePositions?.length ? player.defensePositions : [player.position];
+  const expanded = raw.flatMap((position) => {
+    if (position === '外野手') return ['左翼手', '中堅手', '右翼手'];
+    if (position === 'DH' || position === '代打') return FIELD_POSITIONS.filter((entry) => entry !== '捕手');
+    return [position];
+  });
+  const valid = expanded.filter((position) => FIELD_POSITIONS.includes(position));
+  return [...new Set(valid.length ? valid : ['一塁手'])];
+}
+
+function ensureRosterPlan(state) {
+  state.rosterPlan = state.rosterPlan ? cloneRosterPlan(state.rosterPlan) : createDefaultRosterPlan(state);
+  try {
+    validateLineupSlots(state, state.rosterPlan.lineup);
+    validatePitchingPlan(state, state.rosterPlan);
+  } catch {
+    state.rosterPlan = createDefaultRosterPlan(state);
+  }
+}
+
+function createDefaultRosterPlan(state) {
+  const training = getTrainingEffects(state);
+  const usedHitters = new Set();
+  const lineup = LINEUP_POSITIONS.map((position) => {
+    const candidates = state.roster
+      .filter((player) => player.role === 'hitter' && !usedHitters.has(player.id) && canPlayPosition(player, position))
+      .sort((a, b) => hitterScore(b, training) - hitterScore(a, training));
+    const player = candidates[0] ?? state.roster.find((entry) => entry.role === 'hitter' && !usedHitters.has(entry.id));
+    if (player) usedHitters.add(player.id);
+    return { position, playerId: player?.id ?? null };
+  });
+
+  const starters = state.roster
+    .filter((player) => player.role === 'pitcher' && player.position === '先発')
+    .sort((a, b) => pitcherScore(b, training) - pitcherScore(a, training))
+    .slice(0, CONFIG.roster.starterSlots);
+  const relievers = state.roster
+    .filter((player) => player.role === 'pitcher' && player.position === '中継ぎ')
+    .sort((a, b) => pitcherScore(b, training) - pitcherScore(a, training))
+    .slice(0, CONFIG.roster.relieverSlots);
+  const closer = state.roster
+    .filter((player) => player.role === 'pitcher' && player.position === '抑え')
+    .sort((a, b) => pitcherScore(b, training) - pitcherScore(a, training))[0];
+
+  return {
+    lineup,
+    rotation: starters.map((player) => player.id),
+    nextStarterIndex: 0,
+    bullpen: {
+      relievers: relievers.map((player) => player.id),
+      closerId: closer?.id ?? relievers[0]?.id ?? starters[0]?.id ?? null
+    }
+  };
+}
+
+function cloneRosterPlan(plan) {
+  return {
+    lineup: (plan.lineup ?? []).map((slot) => ({ ...slot })),
+    rotation: [...(plan.rotation ?? [])],
+    nextStarterIndex: plan.nextStarterIndex ?? 0,
+    bullpen: {
+      relievers: [...(plan.bullpen?.relievers ?? [])],
+      closerId: plan.bullpen?.closerId ?? null
+    }
+  };
+}
+
+function validateLineupSlots(state, slots) {
+  if (!Array.isArray(slots) || slots.length !== LINEUP_POSITIONS.length) throw new Error('スタメンは9枠必要です。');
+  const playerIds = new Set();
+  const positions = new Set();
+  for (const slot of slots) {
+    if (!LINEUP_POSITIONS.includes(slot.position)) throw new Error('不明な守備位置です。');
+    if (positions.has(slot.position)) throw new Error('同じ守備位置を重複登録できません。');
+    positions.add(slot.position);
+    const player = state.roster.find((entry) => entry.id === slot.playerId);
+    if (!player || player.role !== 'hitter') throw new Error('野手を9人登録してください。');
+    if (playerIds.has(player.id)) throw new Error('同じ選手を複数枠に登録できません。');
+    if (!canPlayPosition(player, slot.position)) throw new Error(`${player.name}は${slot.position}に登録できません。`);
+    playerIds.add(player.id);
+  }
+}
+
+function validatePitchingPlan(state, plan) {
+  const pitcherIds = new Set();
+  const rotation = plan.rotation ?? [];
+  const relievers = plan.bullpen?.relievers ?? [];
+  if (rotation.length !== CONFIG.roster.starterSlots) throw new Error('先発ローテーションは3人必要です。');
+  if (relievers.length !== CONFIG.roster.relieverSlots) throw new Error('中継ぎは3人必要です。');
+  for (const id of rotation) validatePitcherSlot(state, id, '先発', pitcherIds);
+  for (const id of relievers) validatePitcherSlot(state, id, '中継ぎ', pitcherIds);
+  validatePitcherSlot(state, plan.bullpen?.closerId, '抑え', pitcherIds);
+}
+
+function validatePitcherSlot(state, playerId, expectedRole, pitcherIds) {
+  const player = state.roster.find((entry) => entry.id === playerId);
+  if (!player || player.role !== 'pitcher') throw new Error(`${expectedRole}には投手を登録してください。`);
+  if (pitcherIds.has(player.id)) throw new Error('同じ投手を複数の投手枠に登録できません。');
+  if (player.position !== expectedRole) throw new Error(`${player.name}は${expectedRole}枠に登録できません。`);
+  pitcherIds.add(player.id);
 }
 
 function bestYoungPlayer(state) {
