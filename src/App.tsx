@@ -318,7 +318,7 @@ function EquipmentView({ game, commit }: ViewProps) {
         selected={game.equipment.tactics}
         unlocked={game.unlocked.tactics}
         slots={tacticSlots}
-        onToggle={(id, active) => commit((next) => (active ? unequipTactic(next, id) : equipTactic(next, id)), active ? '作戦を外しました。' : '作戦を装備しました。')}
+        onToggle={(id: string, active: boolean) => commit((next) => (active ? unequipTactic(next, id) : equipTactic(next, id)), active ? '作戦を外しました。' : '作戦を装備しました。')}
       />
       <EquipmentList
         title="練習方針"
@@ -326,7 +326,7 @@ function EquipmentView({ game, commit }: ViewProps) {
         selected={game.equipment.training}
         unlocked={game.unlocked.training}
         slots={trainingSlots}
-        onToggle={(id, active) => commit((next) => (active ? unequipTraining(next, id) : equipTraining(next, id)), active ? '練習方針を外しました。' : '練習方針を装備しました。')}
+        onToggle={(id: string, active: boolean) => commit((next) => (active ? unequipTraining(next, id) : equipTraining(next, id)), active ? '練習方針を外しました。' : '練習方針を装備しました。')}
       />
     </section>
   );
